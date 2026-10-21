@@ -51,20 +51,54 @@ const CAR_ROTATION: Record<Direction, number> = {
 };
 
 const ALGO_LABEL: Record<Algo, string> = {
+  STATIC: "Static Timers (Usual Traffic)",
   RR: "Round Robin (RR)",
   PRIORITY_AGING: "Priority + Aging",
 };
 
 const ALGO_HINT: Record<Algo, string> = {
+  STATIC: "Fixed-duration greens rotate in lane order, including empty lanes while traffic remains.",
   RR: "Every lane gets one time quantum of green in circular order, then preemptively rotates.",
   PRIORITY_AGING: `Prioritizes critical lanes. Waiting queues gain priority weight every ${AGING_STEP}s to eliminate starvation.`,
 };
 
 const isAlgo = (a?: string): a is Algo =>
-  a === "RR" || a === "PRIORITY_AGING";
+  a === "STATIC" || a === "RR" || a === "PRIORITY_AGING";
 
-type Phase = "IDLE" | "RUNNING" | "PAUSED" | "COMPLETED";
+type Phase = "IDLE" | "RUNNING" | "PAUSED" | "STOPPED" | "COMPLETED";
 type DashboardTab = "SAFETY" | "E_CHALLANS";
+type BenchmarkAlgo = "STATIC" | "RR" | "PRIORITY_AGING";
+
+interface BenchmarkReading {
+  algo: BenchmarkAlgo;
+  avgWait: number;
+  served: number;
+  contextSwitches: number;
+}
+
+interface FrozenBenchmark {
+  status: "PAUSED" | "FINAL ANALYSIS";
+  elapsed: number;
+  readings: BenchmarkReading[];
+}
+
+const createBenchmarkSims = (
+  setup: Setup,
+  activeAlgo: BenchmarkAlgo,
+  emergencyLane: Direction | null
+): Partial<Record<BenchmarkAlgo, Sim>> => {
+  const sims: Partial<Record<BenchmarkAlgo, Sim>> = {
+    STATIC: createSim(setup, "STATIC", emergencyLane),
+  };
+  if (activeAlgo !== "STATIC") {
+    sims[activeAlgo] = createSim(
+      setup,
+      activeAlgo,
+      activeAlgo === "PRIORITY_AGING" ? emergencyLane : null
+    );
+  }
+  return sims;
+};
 
 export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   simulationRef,
@@ -86,8 +120,22 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const localSimRef = useRef<Sim>(createSim(setup, selectedAlgo, emergencyLane));
   const simRef = simulationRef ?? localSimRef;
+  const benchmarkSimsRef = useRef<Partial<Record<BenchmarkAlgo, Sim>>>(
+    createBenchmarkSims(setup, selectedAlgo, emergencyLane)
+  );
   const [snap, setSnap] = useState<Snapshot>(() => snapshot(simRef.current));
   const [running, setRunning] = useState<boolean>(false);
+  const [stopped, setStopped] = useState<boolean>(false);
+  const [frozenBenchmark, setFrozenBenchmark] = useState<FrozenBenchmark | null>(null);
+  const benchmarkFrozenRef = useRef(false);
+
+  const advanceBenchmarks = (dt: number, quantum: number, activeAlgo: BenchmarkAlgo) => {
+    const benchmarkAlgos = new Set<BenchmarkAlgo>(["STATIC", activeAlgo]);
+    benchmarkAlgos.forEach((algo) => {
+      const benchmarkSim = benchmarkSimsRef.current[algo];
+      if (benchmarkSim) step(benchmarkSim, dt, algo, quantum, true);
+    });
+  };
 
   const cfgRef = useRef({ algo: selectedAlgo, quantum: timeQuantum, aging, speed });
   cfgRef.current = { algo: selectedAlgo, quantum: timeQuantum, aging, speed };
@@ -111,11 +159,12 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
       selectedAlgo,
       selectedAlgo === "PRIORITY_AGING" ? emergencyLane : null
     );
+    benchmarkSimsRef.current = createBenchmarkSims(setup, selectedAlgo, emergencyLane);
     setSnap(snapshot(simRef.current));
   }, [setup, selectedAlgo, emergencyLane]);
 
   useEffect(() => {
-    setSnap(snapshot(simRef.current));
+    if (!benchmarkFrozenRef.current) setSnap(snapshot(simRef.current));
   }, [simulationRevision, simRef]);
 
   useEffect(() => {
@@ -124,12 +173,18 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     let frameId = 0;
 
     const loop = (now: number) => {
+      if (benchmarkFrozenRef.current) return;
       const c = cfgRef.current;
       const dt = Math.min((now - last) / 1000, 0.1) * c.speed;
       last = now;
       step(simRef.current, dt, c.algo, c.quantum, c.aging);
+      advanceBenchmarks(dt, c.quantum, c.algo);
       setSnap(snapshot(simRef.current));
-      if (simRef.current.finished) {
+      const benchmarksComplete = [...new Set<BenchmarkAlgo>(["STATIC", c.algo])].every(
+        (algo) => benchmarkSimsRef.current[algo]?.finished ?? true
+      );
+      if (simRef.current.finished && benchmarksComplete) {
+        freezeBenchmark("FINAL ANALYSIS");
         setRunning(false);
       } else {
         frameId = requestAnimationFrame(loop);
@@ -143,6 +198,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   useEffect(() => {
     if (!running) return;
     const watchdogTimer = window.setInterval(() => {
+      if (benchmarkFrozenRef.current) return;
       if (checkSimulationWatchdog(simRef.current)) {
         setSnap(snapshot(simRef.current));
       }
@@ -150,13 +206,46 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     return () => window.clearInterval(watchdogTimer);
   }, [running]);
 
-  const phase: Phase = snap.finished
-    ? "COMPLETED"
-    : running
+  const phase: Phase = running
     ? "RUNNING"
+    : snap.finished
+    ? "COMPLETED"
+    : stopped
+    ? "STOPPED"
     : snap.started
     ? "PAUSED"
     : "IDLE";
+
+  const captureBenchmark = (status: FrozenBenchmark["status"]): FrozenBenchmark => {
+    const elapsed = simRef.current.clock;
+    const readings = (["STATIC", selectedAlgo] as BenchmarkAlgo[])
+      .filter((algo, index, algos) => algos.indexOf(algo) === index)
+      .flatMap((algo) => {
+        const benchmarkSim = benchmarkSimsRef.current[algo];
+        if (!benchmarkSim) return [];
+        return [{
+          algo,
+          avgWait: benchmarkSim.served
+            ? benchmarkSim.waitSum / benchmarkSim.served
+            : 0,
+          served: benchmarkSim.served,
+          contextSwitches: benchmarkSim.contextSwitches,
+        }];
+      });
+    return { status, elapsed, readings };
+  };
+
+  const freezeBenchmark = (status: FrozenBenchmark["status"]) => {
+    benchmarkFrozenRef.current = true;
+    setSnap(snapshot(simRef.current));
+    setFrozenBenchmark(captureBenchmark(status));
+  };
+
+  const clearFrozenBenchmark = () => {
+    benchmarkFrozenRef.current = false;
+    setFrozenBenchmark(null);
+    setStopped(false);
+  };
 
   const totalVehicles =
     DIRECTIONS.reduce((n, d) => n + setup[d].count, 0) +
@@ -164,50 +253,79 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const reset = () => {
     setRunning(false);
+    clearFrozenBenchmark();
     setSelectedChallan(null);
     const nextSetup = presetSetup(selectedAlgo);
     setEmergencyLane(null);
     setSetup(nextSetup);
     simRef.current = createSim(nextSetup, selectedAlgo);
+    benchmarkSimsRef.current = createBenchmarkSims(nextSetup, selectedAlgo, null);
     setSnap(snapshot(simRef.current));
   };
 
   const startPause = () => {
     if (phase === "RUNNING") {
+      freezeBenchmark("PAUSED");
       setRunning(false);
-    } else if (phase === "COMPLETED") {
+    } else if (phase === "COMPLETED" || phase === "STOPPED") {
+      clearFrozenBenchmark();
       setSelectedChallan(null);
       simRef.current = createSim(
         setup,
         selectedAlgo,
         selectedAlgo === "PRIORITY_AGING" ? emergencyLane : null
       );
+      benchmarkSimsRef.current = createBenchmarkSims(setup, selectedAlgo, emergencyLane);
       setSnap(snapshot(simRef.current));
       setRunning(true);
     } else if (totalVehicles > 0 || simRef.current.cars.length > 0) {
+      clearFrozenBenchmark();
       setRunning(true);
     }
   };
 
+  const stopKernel = () => {
+    if (phase !== "RUNNING") return;
+    freezeBenchmark("FINAL ANALYSIS");
+    setStopped(true);
+    setRunning(false);
+  };
+
   const stepTick = () => {
-    if (phase === "COMPLETED") return;
+    if (phase === "COMPLETED" || phase === "STOPPED") return;
+    clearFrozenBenchmark();
     const c = cfgRef.current;
     step(simRef.current, 1, c.algo, c.quantum, c.aging);
+    advanceBenchmarks(1, c.quantum, c.algo);
     setSnap(snapshot(simRef.current));
   };
 
   const injectVehicle = (lane: Direction) => {
-    if (addVehicle(simRef.current, lane)) setSnap(snapshot(simRef.current));
+    if (!running || benchmarkFrozenRef.current) return;
+    if (addVehicle(simRef.current, lane)) {
+      new Set<BenchmarkAlgo>(["STATIC", selectedAlgo]).forEach((algo) => {
+        const benchmarkSim = benchmarkSimsRef.current[algo];
+        if (benchmarkSim) addVehicle(benchmarkSim, lane);
+      });
+      setSnap(snapshot(simRef.current));
+    }
   };
 
   const handleRogue = (lane: Direction) => {
+    if (!running || benchmarkFrozenRef.current) return;
     if (!addRogueVehicle(simRef.current, lane)) return;
     setSnap(snapshot(simRef.current));
   };
 
   const injectAmbulance = () => {
+    if (!running || benchmarkFrozenRef.current) return;
     const lane = emergencyLane ?? "SOUTH";
-    if (addVehicle(simRef.current, lane, true)) setSnap(snapshot(simRef.current));
+    if (addVehicle(simRef.current, lane, true)) {
+      benchmarkSimsRef.current.STATIC && addVehicle(benchmarkSimsRef.current.STATIC, lane, true);
+      benchmarkSimsRef.current.PRIORITY_AGING &&
+        addVehicle(benchmarkSimsRef.current.PRIORITY_AGING, lane, true);
+      setSnap(snapshot(simRef.current));
+    }
   };
 
   const toggleSimulatedStaleData = () => {
@@ -235,9 +353,16 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   };
 
   const handleAlgoChange = (algo: Algo) => {
+    const nextSetup = presetSetup(algo);
+    setRunning(false);
+    clearFrozenBenchmark();
     setSelectedAlgo(algo);
-    setSetup(presetSetup(algo));
+    setSetup(nextSetup);
     setEmergencyLane(null);
+    setSelectedChallan(null);
+    simRef.current = createSim(nextSetup, algo);
+    setSnap(snapshot(simRef.current));
+    benchmarkSimsRef.current = createBenchmarkSims(nextSetup, algo, null);
   };
 
   const hasAmbulance = (lane: Direction) =>
@@ -255,7 +380,6 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   };
 
   const activeIdx = snap.active ? DIRECTIONS.indexOf(snap.active) : -1;
-  const preemptive = selectedAlgo === "RR" || selectedAlgo === "PRIORITY_AGING";
   const locked = snap.started;
   const pendingFineTotal = snap.challans
     .filter((challan) => challan.paymentStatus === "Pending")
@@ -265,12 +389,93 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     .map((s) => ({ ...s, end: s.end ?? snap.clock }))
     .filter((s) => s.end - s.start > 0.01)
     .slice(-14);
+  const benchmarkAlgos: BenchmarkAlgo[] =
+    selectedAlgo === "STATIC" ? ["STATIC"] : ["STATIC", selectedAlgo];
+  const liveBenchmarkSnapshots = benchmarkAlgos.map((algo) => {
+    const benchmarkSim = benchmarkSimsRef.current[algo];
+    return {
+      algo,
+      avgWait: benchmarkSim?.served
+        ? benchmarkSim.waitSum / benchmarkSim.served
+        : 0,
+      served: benchmarkSim?.served ?? 0,
+        contextSwitches: benchmarkSim?.contextSwitches ?? 0,
+    };
+  });
+  const benchmarkSnapshots = frozenBenchmark?.readings ?? liveBenchmarkSnapshots;
+  const staticBenchmark = benchmarkSnapshots.find(({ algo }) => algo === "STATIC");
+  const activeBenchmark = benchmarkSnapshots.find(({ algo }) => algo === selectedAlgo);
+  const benchmarkMaxWait = Math.max(
+    0,
+    ...benchmarkSnapshots.map((benchmark) => benchmark.avgWait)
+  );
+  const hasComparisonSample =
+    selectedAlgo !== "STATIC" &&
+    (staticBenchmark?.served ?? 0) > 0 &&
+    (activeBenchmark?.served ?? 0) > 0;
+  const delaySavings =
+    hasComparisonSample && staticBenchmark && activeBenchmark
+      ? staticBenchmark.avgWait - activeBenchmark.avgWait
+      : null;
+  const efficiencyGain =
+    delaySavings !== null && staticBenchmark && staticBenchmark.avgWait > 0
+      ? (delaySavings / staticBenchmark.avgWait) * 100
+      : null;
+  const activeAlgoLabel =
+    selectedAlgo === "RR"
+      ? "Round Robin (Cyclic Quantum)"
+      : selectedAlgo === "PRIORITY_AGING"
+      ? "Priority + Dynamic Aging"
+      : "Static Timers (Usual Traffic)";
+  const frozenStaticBenchmark = frozenBenchmark?.readings.find(
+    ({ algo }) => algo === "STATIC"
+  );
+  const frozenActiveBenchmark = frozenBenchmark?.readings.find(
+    ({ algo }) => algo === selectedAlgo
+  );
+  const frozenDelaySavings =
+    selectedAlgo !== "STATIC" &&
+    frozenStaticBenchmark?.served &&
+    frozenActiveBenchmark?.served
+      ? frozenStaticBenchmark.avgWait - frozenActiveBenchmark.avgWait
+      : null;
+  const frozenEfficiencyGain =
+    frozenDelaySavings !== null &&
+    frozenStaticBenchmark &&
+    frozenStaticBenchmark.avgWait > 0
+      ? (frozenDelaySavings / frozenStaticBenchmark.avgWait) * 100
+      : null;
+  const frozenThroughput =
+    frozenBenchmark && frozenActiveBenchmark && frozenBenchmark.elapsed > 0
+      ? (frozenActiveBenchmark.served / frozenBenchmark.elapsed) * 60
+      : 0;
+  const frozenSwitchLabel =
+    frozenActiveBenchmark?.contextSwitches === 1 ? "context switch" : "context switches";
+  const benchmarkStatusLabel = frozenBenchmark
+    ? `${frozenBenchmark.status === "PAUSED" ? "RUN PAUSED" : "FINAL ANALYSIS"} • ${frozenBenchmark.elapsed.toFixed(1)}s`
+    : running
+    ? `LIVE BENCHMARK • ${snap.clock.toFixed(1)}s`
+    : "READY";
+  const frozenConclusion =
+    frozenBenchmark && selectedAlgo !== "STATIC"
+      ? frozenDelaySavings === null ||
+        !frozenStaticBenchmark ||
+        !frozenActiveBenchmark
+        ? `Final analysis captured at ${frozenBenchmark.elapsed.toFixed(1)}s. Not enough served vehicles in both runs to calculate a reliable comparison.`
+        : frozenDelaySavings > 0
+        ? `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers averaged ${frozenStaticBenchmark.avgWait.toFixed(2)}s of wait per car, while ${activeAlgoLabel} averaged ${frozenActiveBenchmark.avgWait.toFixed(2)}s. Average wait fell by ${frozenDelaySavings.toFixed(2)}s per car (${frozenEfficiencyGain?.toFixed(1)}%). The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`
+        : frozenDelaySavings < 0
+        ? `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers averaged ${frozenStaticBenchmark.avgWait.toFixed(2)}s of wait per car, while ${activeAlgoLabel} averaged ${frozenActiveBenchmark.avgWait.toFixed(2)}s. Average wait increased by ${Math.abs(frozenDelaySavings).toFixed(2)}s per car (${Math.abs(frozenEfficiencyGain ?? 0).toFixed(1)}%) in this run. The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`
+        : `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers and ${activeAlgoLabel} matched at ${frozenStaticBenchmark.avgWait.toFixed(2)}s average wait per car. The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`
+      : frozenBenchmark
+      ? "Static Timers is the selected baseline. Select Round Robin or Priority + Dynamic Aging to generate a comparative efficiency report."
+      : null;
 
   const selectCls =
-    "w-full bg-slate-950/80 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 transition-all disabled:opacity-40";
+    "w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all disabled:opacity-50";
 
   return (
-    <div className="space-y-6 font-mono text-slate-100 max-w-7xl mx-auto p-2">
+    <div className="font-executive space-y-6 text-slate-100 max-w-7xl mx-auto p-2">
       {/* Top Header Control Bar */}
       <div className="flex flex-wrap items-center justify-between gap-4 p-4 rounded-2xl bg-slate-900/90 backdrop-blur-xl border border-slate-800 shadow-2xl">
         <div className="flex items-center gap-3 flex-wrap">
@@ -288,15 +493,24 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
               ? "PAUSE KERNEL"
               : phase === "PAUSED"
               ? "RESUME KERNEL"
-              : phase === "COMPLETED"
+              : phase === "COMPLETED" || phase === "STOPPED"
               ? "RESTART KERNEL"
               : "START KERNEL"}
           </button>
 
           <button
+            type="button"
+            onClick={stopKernel}
+            disabled={phase !== "RUNNING"}
+            className="px-4 py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-xs font-bold text-rose-300 border border-rose-500/30 transition-all disabled:opacity-40"
+          >
+            STOP KERNEL
+          </button>
+
+          <button
             onClick={stepTick}
-            disabled={phase === "RUNNING" || phase === "COMPLETED" || totalVehicles === 0}
-            className="px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 text-xs font-semibold text-cyan-300 border border-cyan-500/30 transition-all disabled:opacity-40"
+            disabled={phase === "RUNNING" || phase === "COMPLETED" || phase === "STOPPED" || totalVehicles === 0}
+            className="px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 text-xs font-bold text-cyan-300 border border-cyan-500/30 transition-all disabled:opacity-40"
           >
             STEP TICK
           </button>
@@ -334,12 +548,14 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
               className={`px-2.5 py-0.5 rounded-lg text-[11px] font-bold tracking-wide ${
                 phase === "RUNNING"
                   ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30"
+                  : frozenBenchmark
+                  ? "bg-amber-400/10 text-amber-200 border border-amber-400/30"
                   : phase === "COMPLETED"
                   ? "bg-cyan-500/10 text-cyan-400 border border-cyan-500/30"
                   : "bg-slate-800 text-slate-400 border border-slate-700"
               }`}
             >
-              {phase}
+              {frozenBenchmark ? "FROZEN" : phase}
             </span>
           </div>
         </div>
@@ -619,7 +835,6 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
               <select
                 value={timeQuantum}
                 onChange={(e) => setTimeQuantum(Number(e.target.value))}
-                disabled={!preemptive}
                 className={selectCls}
               >
                 {[1, 2, 3, 5].map((q) => (
@@ -737,7 +952,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   <button
     key={d}
     onClick={() => injectVehicle(d)}
-    disabled={!snap.started || snap.queued[d] >= MAX_PER_LANE}
+    disabled={phase !== "RUNNING" || snap.queued[d] >= MAX_PER_LANE}
     className="px-2 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-800 border border-slate-700/80 text-xs font-bold text-cyan-400 transition-all disabled:opacity-30 shadow-sm"
     title={`Add vehicle to ${d}`}
   >
@@ -750,7 +965,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   <button
     key={`rogue-${d}`}
     onClick={() => handleRogue(d)}
-    disabled={!snap.started}
+    disabled={phase !== "RUNNING"}
     className="px-2 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/40 text-[11px] font-bold text-rose-300 transition-all disabled:opacity-30"
     title={`Vehicle runs the red light on ${d}`}
   >
@@ -913,12 +1128,143 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
               { label: "SERVED", value: `${snap.served}`, cls: "text-purple-400" },
               { label: "LONGEST WAIT", value: `${snap.maxLaneWait.toFixed(1)}s`, cls: "text-rose-400" },
             ].map((m) => (
-              <div key={m.label} className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 shadow-sm">
-                <span className="text-slate-500 block text-[9px] font-semibold mb-1">{m.label}</span>
-                <span className={`${m.cls} font-black text-sm tracking-tight`}>{m.value}</span>
+              <div key={m.label} className="p-3 rounded-2xl bg-slate-950/80 border border-slate-700 shadow-sm">
+                <span className="text-slate-300 block text-[10px] font-bold mb-1">{m.label}</span>
+                <span className={`${m.cls} font-black text-base tracking-tight`}>{m.value}</span>
               </div>
             ))}
           </div>
+
+          {/* Comparative efficiency benchmark */}
+          <section
+            aria-labelledby="efficiency-benchmark-title"
+            aria-live="polite"
+            className="mt-4 overflow-hidden rounded-2xl border border-slate-300 bg-gradient-to-br from-white via-slate-50 to-slate-100 p-4 text-slate-900 shadow-[0_12px_40px_rgba(0,0,0,0.18)] sm:p-6"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-amber-700">
+                  {frozenBenchmark ? "AIML Department Expo · Final report" : "AIML Department Expo · Live analysis"}
+                </p>
+                <h2
+                  id="efficiency-benchmark-title"
+                  className="mt-1 text-lg font-black tracking-tight text-slate-950 sm:text-xl"
+                >
+                  Comparative Efficiency Benchmark
+                </h2>
+                <p className="mt-1 text-xs font-semibold leading-relaxed text-slate-600">
+                  Average vehicle wait · only the selected scheduler is replayed against the static baseline
+                </p>
+              </div>
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[10px] font-black uppercase tracking-wider ${frozenBenchmark ? "border-slate-400 bg-slate-200 text-slate-900" : running ? "border-emerald-300 bg-emerald-100 text-emerald-900" : "border-amber-300 bg-amber-100 text-amber-900"}`}>
+                <span className="h-2 w-2 rounded-full bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.6)]" />
+                {benchmarkStatusLabel}
+              </span>
+            </div>
+
+            <div className="mt-5 space-y-4">
+              {benchmarkSnapshots.map(({ algo, avgWait, served, contextSwitches }) => {
+                const width =
+                  benchmarkMaxWait > 0
+                    ? (avgWait / benchmarkMaxWait) * 100
+                    : 0;
+                const label =
+                  algo === "STATIC"
+                    ? "Static Timers (Usual Traffic)"
+                    : algo === "RR"
+                    ? "Round Robin (Cyclic Quantum)"
+                    : "Priority + Dynamic Aging";
+                const barColor =
+                  algo === "STATIC"
+                    ? "from-slate-400 to-slate-500"
+                    : algo === "RR"
+                    ? "from-emerald-400 to-emerald-600"
+                    : "from-emerald-400 to-emerald-600";
+
+                return (
+                  <div key={algo} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="truncate text-xs font-bold text-slate-800 sm:text-sm">
+                        {label}
+                      </span>
+                      {algo === selectedAlgo && algo !== "STATIC" && (
+                        <span className="shrink-0 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[9px] font-black uppercase tracking-wider text-amber-900">
+                          Active
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-right font-sans text-xs font-bold tabular-nums text-slate-900 sm:text-sm">
+                      {avgWait.toFixed(2)}s
+                      <span className="ml-1 block text-[10px] font-semibold text-slate-600">
+                        n={served} · {contextSwitches} switches
+                      </span>
+                    </span>
+                    <div
+                      role="progressbar"
+                      aria-label={`${label} average wait`}
+                      aria-valuemin={0}
+                      aria-valuemax={benchmarkMaxWait || 0}
+                      aria-valuenow={avgWait}
+                      className="col-span-2 h-3 overflow-hidden rounded-full border border-slate-300 bg-white"
+                    >
+                      <div
+                        className={`h-full rounded-full bg-gradient-to-r ${barColor} ${frozenBenchmark ? "" : "transition-[width] duration-300"}`}
+                        style={{ width: `${width}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-5 grid gap-3 border-t border-slate-300 pt-4 sm:grid-cols-[1fr_auto] sm:items-center">
+              <div>
+                <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-slate-700">
+                  {selectedAlgo === "STATIC"
+                    ? "STATIC TIMERS BASELINE"
+                    : `${activeAlgoLabel.toUpperCase()} VS STATIC TIMERS`}
+                </p>
+                <p className="mt-1 text-xs font-semibold leading-relaxed text-slate-600">
+                  Efficiency gain = (static avg wait − {activeAlgoLabel.toLowerCase()} avg wait) ÷ static avg wait × 100
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:min-w-[260px]">
+                <div className={`rounded-xl border px-3 py-2.5 shadow-[0_8px_24px_rgba(16,185,129,0.12)] ${delaySavings === null || delaySavings >= 0 ? "border-emerald-300 bg-emerald-50" : "border-rose-300 bg-rose-50 shadow-[0_8px_24px_rgba(244,63,94,0.12)]"}`}>
+                  <span className={`block text-[10px] font-bold uppercase tracking-wider ${delaySavings === null || delaySavings >= 0 ? "text-emerald-900" : "text-rose-900"}`}>
+                    Delay saved / car
+                  </span>
+                  <span className={`mt-1 block font-sans text-xl font-black tabular-nums ${delaySavings === null || delaySavings >= 0 ? "text-emerald-800" : "text-rose-800"}`}>
+                    {delaySavings === null ? "—" : `${delaySavings.toFixed(2)}s`}
+                  </span>
+                </div>
+                <div className={`rounded-xl border px-3 py-2.5 shadow-[0_8px_24px_rgba(16,185,129,0.12)] ${efficiencyGain === null || efficiencyGain >= 0 ? "border-emerald-300 bg-emerald-50" : "border-rose-300 bg-rose-50 shadow-[0_8px_24px_rgba(244,63,94,0.12)]"}`}>
+                  <span className={`block text-[10px] font-bold uppercase tracking-wider ${efficiencyGain === null || efficiencyGain >= 0 ? "text-emerald-900" : "text-rose-900"}`}>
+                    Efficiency gain
+                  </span>
+                  <span className={`mt-1 block font-sans text-xl font-black tabular-nums ${efficiencyGain === null || efficiencyGain >= 0 ? "text-emerald-800" : "text-rose-800"}`}>
+                    {efficiencyGain === null ? "—" : `${efficiencyGain.toFixed(1)}%`}
+                  </span>
+                </div>
+              </div>
+              {frozenBenchmark && frozenConclusion && (
+                <div className="mt-4 rounded-xl border border-slate-300 bg-white p-4 shadow-[0_6px_20px_rgba(15,23,42,0.08)]">
+                  <div className="text-[10px] font-black uppercase tracking-[0.18em] text-slate-500">
+                    Frozen performance conclusion
+                  </div>
+                  <p className="mt-2 text-sm font-semibold leading-relaxed text-slate-800">
+                    {frozenConclusion}
+                  </p>
+                </div>
+              )}
+            </div>
+            {delaySavings === null && (
+              <p className="mt-2 text-right text-[11px] font-semibold text-slate-600">
+                {selectedAlgo === "STATIC"
+                  ? "Static is the selected baseline. Choose Round Robin or Priority + Dynamic Aging to compare efficiency."
+                  : "Awaiting served vehicles in the static baseline and selected scheduler."}
+              </p>
+            )}
+          </section>
         </div>
       </div>
     </div>

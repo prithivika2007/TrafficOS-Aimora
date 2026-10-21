@@ -26,7 +26,7 @@
   body {
     background-color: var(--bg-primary);
     color: #f1f5f9;
-    font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+    font-family: "Segoe UI", Inter, Calibri, ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     /* Subtle background grid + dual terminal ambient radial glow */
@@ -41,6 +41,10 @@
 }
 
 /* Monospace & Terminal Typography Utility */
+.font-executive {
+  font-family: "Segoe UI", Inter, Calibri, ui-sans-serif, system-ui, sans-serif;
+}
+
 .font-mono-code {
   font-family: 'JetBrains Mono', 'Fira Code', 'Roboto Mono', Menlo, Monaco, Consolas, monospace;
 }
@@ -101,4 +105,54 @@
 
 .animate-gantt {
   animation: gantt-grow 250ms ease-out forwards;
+}
+
+@keyframes traffic-signal-cycle {
+  0%, 16% {
+    opacity: 1;
+    filter: brightness(1.35);
+  }
+  24%, 100% {
+    opacity: 0.28;
+    filter: brightness(0.65);
+  }
+}
+
+.traffic-signal-light {
+  width: 3.25rem;
+  height: 3.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 9999px;
+  opacity: 0.28;
+  animation: traffic-signal-cycle 6s ease-in-out infinite;
+}
+
+.traffic-signal-red {
+  background: #ef4444;
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.2), inset 0 2px 8px rgba(255, 255, 255, 0.25);
+  animation-delay: 0s;
+}
+
+.traffic-signal-amber {
+  background: #f59e0b;
+  box-shadow: 0 0 18px rgba(245, 158, 11, 0.2), inset 0 2px 8px rgba(255, 255, 255, 0.25);
+  animation-delay: -4s;
+}
+
+.traffic-signal-green {
+  background: #10b981;
+  box-shadow: 0 0 18px rgba(16, 185, 129, 0.2), inset 0 2px 8px rgba(255, 255, 255, 0.25);
+  animation-delay: -2s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .traffic-signal-light {
+    animation: none;
+    opacity: 0.65;
+  }
+
+  .traffic-signal-green {
+    opacity: 1;
+    filter: brightness(1.25);
+  }
 }

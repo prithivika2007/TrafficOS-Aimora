@@ -33,7 +33,7 @@ import { createEChallan } from "./eChallan";
 import type { EChallan, ViolationType } from "./eChallan";
 
 export type Direction = "NORTH" | "EAST" | "SOUTH" | "WEST";
-export type Algo = "RR" | "PRIORITY_AGING";
+export type Algo = "STATIC" | "RR" | "PRIORITY_AGING";
 export type EmergencyState =
   | "IDLE"
   | "CLEARING_TO_EMERGENCY"
@@ -434,12 +434,18 @@ export function pickLane(sim: Sim, algo: Algo, aging: boolean): Direction | null
   const cands = DIRECTIONS.filter((d) => queueLen(sim, d) > 0);
   if (cands.length === 0) return null;
 
-  const starved = cands
-    .filter((lane) => sim.starvation[lane] >= STARVATION_LIMIT_SECONDS)
-    .sort((a, b) => sim.starvation[b] - sim.starvation[a]);
-  if (starved.length > 0) return starved[0];
+  if (algo !== "STATIC") {
+    const starved = cands
+      .filter((lane) => sim.starvation[lane] >= STARVATION_LIMIT_SECONDS)
+      .sort((a, b) => sim.starvation[b] - sim.starvation[a]);
+    if (starved.length > 0) return starved[0];
+  }
 
   switch (algo) {
+    case "STATIC": {
+      const lastIndex = sim.lastLane ? DIRECTIONS.indexOf(sim.lastLane) : -1;
+      return DIRECTIONS[(lastIndex + 1) % DIRECTIONS.length];
+    }
     case "RR": {
       for (let i = 1; i <= DIRECTIONS.length; i++) {
         const idx = (sim.rrPtr + i + DIRECTIONS.length) % DIRECTIONS.length;
@@ -722,8 +728,7 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
         }
       }
     } else {
-      const preemptive = algo === "RR" || algo === "PRIORITY_AGING";
-      const expired = preemptive && sim.sliceElapsed >= quantum - 1e-9;
+      const expired = sim.sliceElapsed >= quantum - 1e-9;
       if (!expired || sim.safety.greenElapsed < MIN_GREEN_SECONDS) {
         while (sim.releaseTimer >= HEADWAY - 1e-9 && queueLen(sim, lane) > 0) {
           const head = queueOf(sim, lane)[0];
