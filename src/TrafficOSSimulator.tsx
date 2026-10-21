@@ -13,7 +13,9 @@ import {
   presetSetup,
   snapshot,
   step,
+  addRogueVehicle,
 } from "./simEngine";
+import type { EChallan } from "./eChallan";
 
 interface TrafficOSSimulatorProps {
   initialAlgoConfig?: {
@@ -56,6 +58,7 @@ const isAlgo = (a?: string): a is Algo =>
   a === "RR" || a === "PRIORITY_AGING";
 
 type Phase = "IDLE" | "RUNNING" | "PAUSED" | "COMPLETED";
+type DashboardTab = "SAFETY" | "E_CHALLANS";
 
 export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   initialAlgoConfig,
@@ -70,6 +73,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [speed, setSpeed] = useState<number>(1);
   const [setup, setSetup] = useState<Setup>(() => presetSetup(initialAlgo));
   const [emergencyLane, setEmergencyLane] = useState<Direction | null>(null);
+  const [dashboardTab, setDashboardTab] = useState<DashboardTab>("SAFETY");
+  const [selectedChallan, setSelectedChallan] = useState<EChallan | null>(null);
 
   const simRef = useRef<Sim>(createSim(setup, selectedAlgo, emergencyLane));
   const [snap, setSnap] = useState<Snapshot>(() => snapshot(simRef.current));
@@ -136,6 +141,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const reset = () => {
     setRunning(false);
+    setSelectedChallan(null);
     const nextSetup = presetSetup(selectedAlgo);
     setEmergencyLane(null);
     setSetup(nextSetup);
@@ -147,6 +153,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     if (phase === "RUNNING") {
       setRunning(false);
     } else if (phase === "COMPLETED") {
+      setSelectedChallan(null);
       simRef.current = createSim(
         setup,
         selectedAlgo,
@@ -168,6 +175,11 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const injectVehicle = (lane: Direction) => {
     if (addVehicle(simRef.current, lane)) setSnap(snapshot(simRef.current));
+  };
+
+  const handleRogue = (lane: Direction) => {
+    if (!addRogueVehicle(simRef.current, lane)) return;
+    setSnap(snapshot(simRef.current));
   };
 
   const injectAmbulance = () => {
@@ -214,6 +226,9 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const activeIdx = snap.active ? DIRECTIONS.indexOf(snap.active) : -1;
   const preemptive = selectedAlgo === "RR" || selectedAlgo === "PRIORITY_AGING";
   const locked = snap.started;
+  const pendingFineTotal = snap.challans
+    .filter((challan) => challan.paymentStatus === "Pending")
+    .reduce((total, challan) => total + challan.fineAmount, 0);
 
   const segs = snap.segments
     .map((s) => ({ ...s, end: s.end ?? snap.clock }))
@@ -298,6 +313,211 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
           </div>
         </div>
       </div>
+      <section
+        aria-live="polite"
+        className="space-y-3 rounded-xl border border-slate-800 bg-slate-900/70 p-3"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex gap-2">
+            {([
+              ["SAFETY", "Safety Monitor"],
+              ["E_CHALLANS", "E-Challans"],
+            ] as const).map(([tab, label]) => (
+              <button
+                key={tab}
+                type="button"
+                onClick={() => setDashboardTab(tab)}
+                aria-pressed={dashboardTab === tab}
+                className={`rounded-lg border px-3 py-2 text-[11px] font-bold transition-colors ${
+                  dashboardTab === tab
+                    ? "border-cyan-400/50 bg-cyan-400/10 text-cyan-300"
+                    : "border-slate-700 text-slate-400 hover:border-slate-500"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
+            Simulated prototype data · in-memory only · no official issuance or real payment
+          </span>
+        </div>
+
+        {dashboardTab === "SAFETY" ? (
+          <div className="space-y-2 rounded-xl border border-rose-500/30 bg-slate-900/70 p-3">
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <h2 className="font-bold text-rose-300">KERNEL SAFETY MONITOR</h2>
+              <span className="font-bold text-rose-200">VIOLATIONS: {snap.violations}</span>
+            </div>
+            {snap.violationLog.length > 0 && (
+              <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-2.5">
+                <div className="text-[11px] font-bold text-rose-200">
+                  SAFETY ALERT · {snap.violationLog[snap.violationLog.length - 1].type} ·{" "}
+                  {snap.violationLog[snap.violationLog.length - 1].lane}
+                </div>
+                <p className="mt-1 text-[10px] text-slate-300">
+                  {snap.violationLog[snap.violationLog.length - 1].description}
+                </p>
+              </div>
+            )}
+            {snap.safetyHoldActive && snap.signalPhase === "ALL_RED" && (
+              <div className="rounded-lg border border-amber-400/30 bg-amber-400/10 px-2.5 py-2 text-[11px] font-bold text-amber-200">
+                SAFETY HOLD · ALL RED ·{" "}
+                {snap.phaseRemaining > 0
+                  ? `${snap.phaseRemaining.toFixed(1)}s until next green`
+                  : snap.junctionClear
+                  ? "CLEARANCE COMPLETE"
+                  : "WAITING FOR JUNCTION CLEARANCE"}
+              </div>
+            )}
+            {snap.safetyHoldPending && (
+              <div className="text-[10px] font-semibold text-amber-200">
+                CLEARANCE PENDING · next green waits for all-red safety hold
+              </div>
+            )}
+            <div className="space-y-1">
+              {snap.violationLog
+                .slice(-5)
+                .reverse()
+                .map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="grid grid-cols-[auto_1fr] gap-x-2 text-[10px] text-slate-300"
+                  >
+                    <span className="font-bold text-rose-300">{entry.id}</span>
+                    <span>
+                      t={entry.timestamp.toFixed(1)}s · {entry.lane} · {entry.vehicleId} ·{" "}
+                      {entry.type} · +{entry.additionalHoldSeconds}s hold · #{entry.violationCount}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3 rounded-xl border border-cyan-500/20 bg-slate-950/50 p-3">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {[
+                { label: "TOTAL CHALLANS", value: snap.challans.length },
+                {
+                  label: "PENDING FINES",
+                  value: `₹${pendingFineTotal.toLocaleString("en-IN")}`,
+                },
+                {
+                  label: "PENDING COUNT",
+                  value: snap.challans.filter((item) => item.paymentStatus === "Pending").length,
+                },
+              ].map((metric) => (
+                <div
+                  key={metric.label}
+                  className="rounded-lg border border-slate-800 bg-slate-900/80 p-2.5"
+                >
+                  <span className="block text-[9px] font-semibold text-slate-500">
+                    {metric.label}
+                  </span>
+                  <span className="text-sm font-black text-cyan-300">{metric.value}</span>
+                </div>
+              ))}
+            </div>
+            <h2 className="text-[11px] font-bold uppercase tracking-wider text-slate-300">
+              Recent E-Challans
+            </h2>
+            {snap.challans.length === 0 ? (
+              <p className="text-xs text-slate-500">No simulated challans have been generated.</p>
+            ) : (
+              <div className="space-y-2">
+                {snap.challans
+                  .slice(-5)
+                  .reverse()
+                  .map((challan) => (
+                    <article
+                      key={challan.challanNumber}
+                      className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-900/70 p-2.5"
+                    >
+                      <div className="min-w-0 space-y-0.5 text-[10px] text-slate-300">
+                        <div className="font-bold text-cyan-300">{challan.challanNumber}</div>
+                        <div>
+                          {challan.vehicleId} · Simulated plate: {challan.registrationNumber}
+                        </div>
+                        <div>
+                          {challan.violationType} · {challan.lane} · t=
+                          {challan.simulationTimestamp.toFixed(1)}s
+                        </div>
+                        <div>
+                          ₹{challan.fineAmount.toLocaleString("en-IN")} ·{" "}
+                          <span className="text-amber-300">{challan.paymentStatus}</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedChallan(challan)}
+                        className="shrink-0 rounded-lg border border-cyan-500/30 px-2.5 py-1.5 text-[10px] font-bold text-cyan-300 transition-colors hover:bg-cyan-500/10"
+                      >
+                        View Details
+                      </button>
+                    </article>
+                  ))}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {selectedChallan && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4"
+          role="presentation"
+          onClick={() => setSelectedChallan(null)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="challan-detail-title"
+            className="w-full max-w-lg space-y-4 rounded-2xl border border-cyan-500/30 bg-slate-900 p-5 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 id="challan-detail-title" className="text-sm font-bold text-cyan-300">
+                  E-Challan Details
+                </h2>
+                <p className="mt-1 text-xs font-bold text-slate-100">
+                  {selectedChallan.challanNumber}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedChallan(null)}
+                className="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+              >
+                Close
+              </button>
+            </div>
+            <dl className="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-2 text-xs">
+              {[
+                ["Violation ID", selectedChallan.violationId],
+                ["Violation", selectedChallan.violationType],
+                ["Description", selectedChallan.description],
+                ["Lane", selectedChallan.lane],
+                ["Intersection", selectedChallan.intersectionId],
+                ["Simulation time", `${selectedChallan.simulationTimestamp.toFixed(1)}s`],
+                ["Vehicle ID", selectedChallan.vehicleId],
+                ["Simulated plate", selectedChallan.registrationNumber],
+                ["Fine amount", `₹${selectedChallan.fineAmount.toLocaleString("en-IN")}`],
+                ["Payment status", selectedChallan.paymentStatus],
+              ].map(([label, value]) => (
+                <React.Fragment key={label}>
+                  <dt className="text-slate-500">{label}</dt>
+                  <dd className="break-words text-slate-200">{value}</dd>
+                </React.Fragment>
+              ))}
+            </dl>
+            <p className="border-t border-slate-800 pt-3 text-[10px] text-slate-500">
+              Simulated prototype record only. Not an official government challan; no real
+              payment is collected. Records are held in memory and reset with the simulation.
+            </p>
+          </section>
+        </div>
+      )}
 
       {/* Main Dashboard Layout */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -449,16 +669,29 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             </label>
             <div className={`grid ${selectedAlgo === "PRIORITY_AGING" ? "grid-cols-5" : "grid-cols-4"} gap-2`}>
               {DIRECTIONS.map((d) => (
-                <button
-                  key={d}
-                  onClick={() => injectVehicle(d)}
-                  disabled={!snap.started || snap.queued[d] >= MAX_PER_LANE}
-                  className="px-2 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-800 border border-slate-700/80 text-xs font-bold text-cyan-400 transition-all disabled:opacity-30 shadow-sm"
-                  title={`Add vehicle to ${d}`}
-                >
-                  + {LANE_SHORT[d]}
-                </button>
-              ))}
+  <button
+    key={d}
+    onClick={() => injectVehicle(d)}
+    disabled={!snap.started || snap.queued[d] >= MAX_PER_LANE}
+    className="px-2 py-2 rounded-xl bg-slate-950/80 hover:bg-slate-800 border border-slate-700/80 text-xs font-bold text-cyan-400 transition-all disabled:opacity-30 shadow-sm"
+    title={`Add vehicle to ${d}`}
+  >
+    + {LANE_SHORT[d]}
+  </button>
+))}
+
+{/* Rogue (red-light violator) buttons */}
+{DIRECTIONS.map((d) => (
+  <button
+    key={`rogue-${d}`}
+    onClick={() => handleRogue(d)}
+    disabled={!snap.started}
+    className="px-2 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/40 text-[11px] font-bold text-rose-300 transition-all disabled:opacity-30"
+    title={`Vehicle runs the red light on ${d}`}
+  >
+    ⚠ {LANE_SHORT[d]}
+  </button>
+))}
               {selectedAlgo === "PRIORITY_AGING" && (
                 <button
                   onClick={injectAmbulance}

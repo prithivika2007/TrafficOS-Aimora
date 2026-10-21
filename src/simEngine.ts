@@ -9,17 +9,22 @@
 import {
   activateGreen,
   advanceSafetyPhase,
+  applySafetyHold,
   approveGreenSwitch,
   beginSafetySwitch,
   createSafetyState,
   MAX_GREEN_SECONDS,
   MIN_GREEN_SECONDS,
+  registerViolation,
   STARVATION_LIMIT_SECONDS,
+  startAllRed,
 } from "./safetyLayer";
 import type {
   SafetyState,
   SignalPhase,
 } from "./safetyLayer";
+import { createEChallan } from "./eChallan";
+import type { EChallan, ViolationType } from "./eChallan";
 
 export type Direction = "NORTH" | "EAST" | "SOUTH" | "WEST";
 export type Algo = "RR" | "PRIORITY_AGING";
@@ -49,6 +54,7 @@ export interface Car {
   arrival: number;
   releasedAt: number | null;
   emergency: boolean;
+  rogue?: boolean; // red-light violator
 }
 
 export interface Segment {
@@ -56,6 +62,18 @@ export interface Segment {
   start: number;
   end: number | null; // null = still green
   emergency: boolean;
+}
+export interface ViolationLogEntry {
+  id: string;
+  intersectionId: string;
+  lane: Direction;
+  timestamp: number; // sim seconds
+  vehicleId: string;
+  registrationNumber: string;
+  type: ViolationType;
+  description: string;
+  additionalHoldSeconds: number;
+  violationCount: number;
 }
 
 export interface LaneSetup {
@@ -79,6 +97,9 @@ export interface Sim {
   priority: Record<Direction, number>;
   safety: SafetyState;
   segments: Segment[];
+  violations: number;
+  violationLog: ViolationLogEntry[];
+  challans: EChallan[];
   contextSwitches: number;
   served: number;
   waitSum: number;
@@ -164,6 +185,9 @@ export function createSim(
     },
     safety: createSafetyState(),
     segments: [],
+    violations: 0,
+    violationLog: [],
+    challans: [],
     contextSwitches: 0,
     served: 0,
     waitSum: 0,
@@ -226,6 +250,109 @@ export function addVehicle(sim: Sim, lane: Direction, emergency = false): boolea
   if (emergency && sim.started && sim.emergencyState === "IDLE") {
     beginEmergencyClearance(sim, car);
   }
+  sim.finished = false;
+  return true;
+}
+// ---------- Step 2: violations ----------
+const JUNCTION_EXIT = 62; // progress % where the junction box ends, tweak to match your canvas
+
+/** True when no released vehicle is still inside the junction box. */
+const junctionClear = (sim: Sim): boolean =>
+  !sim.cars.some((c) => c.released && c.progress < JUNCTION_EXIT);
+
+function advanceReleasedVehicles(sim: Sim, elapsed: number) {
+  const remaining: Car[] = [];
+  for (const car of sim.cars) {
+    if (!car.released) {
+      remaining.push(car);
+      continue;
+    }
+    car.progress += CAR_SPEED * elapsed;
+    if (car.progress >= 100) {
+      if (!car.rogue) {
+        sim.served++;
+        sim.waitSum += (car.releasedAt ?? sim.clock) - car.arrival;
+        sim.tatSum += sim.clock - car.arrival;
+      }
+    } else {
+      remaining.push(car);
+    }
+  }
+  sim.cars = remaining;
+}
+
+/** A lane is RED unless it holds the green (normal or emergency). */
+export const isLaneRed = (sim: Sim, lane: Direction): boolean =>
+  !(sim.active === lane && (sim.safety.phase === "GREEN" || sim.emergencyState === "ACTIVE"));
+
+/** Inject a vehicle that crosses the stop line on RED. */
+export function addRogueVehicle(sim: Sim, lane: Direction): boolean {
+  if (!isLaneRed(sim, lane)) return false; // not a violation on green
+  const emergencyClearance =
+    sim.emergencyState === "CLEARING_TO_EMERGENCY" ||
+    sim.emergencyState === "CLEARING_TO_NORMAL";
+  if (emergencyClearance) {
+    sim.safety.phase = "ALL_RED";
+    sim.safety.remaining = sim.clearance;
+  } else if (sim.emergencyState === "ACTIVE") {
+    sim.safety.phase = "GREEN";
+  }
+  const vehicleId = sim.nextId;
+  const violationId = `VIO-${String(vehicleId).padStart(6, "0")}`;
+  if (
+    sim.violationLog.some((entry) => entry.id === violationId) ||
+    sim.challans.some((challan) => challan.violationId === violationId)
+  ) {
+    return false;
+  }
+  sim.nextId++;
+  sim.cars.push({
+    id: vehicleId,
+    lane,
+    progress: STOP_LINE[lane],
+    released: true,
+    arrival: sim.clock,
+    releasedAt: sim.clock,
+    emergency: false,
+    rogue: true,
+  });
+  const additionalHoldSeconds = registerViolation(sim.safety, lane, sim.logs);
+  sim.violations++;
+  if (emergencyClearance) {
+    sim.clearance += additionalHoldSeconds;
+    sim.safety.remaining = sim.clearance;
+  }
+  const violation: ViolationLogEntry = {
+    id: violationId,
+    intersectionId: "TRAFFICOS-JUNCTION",
+    lane,
+    timestamp: Math.round(sim.clock * 10) / 10,
+    vehicleId: `VEH-${String(vehicleId).padStart(6, "0")}`,
+    registrationNumber: `SIMULATED-PLATE-${String(vehicleId).padStart(6, "0")}`,
+    type: "RED_LIGHT",
+    description: `${lane} vehicle crossed the stop line while its signal was red.`,
+    additionalHoldSeconds,
+    violationCount: sim.violations,
+  };
+  sim.violationLog.push(violation);
+  sim.challans.push(
+    createEChallan(
+      {
+        violationId: violation.id,
+        simulationTimestamp: violation.timestamp,
+        lane: violation.lane,
+        intersectionId: violation.intersectionId,
+        vehicleId: violation.vehicleId,
+        registrationNumber: violation.registrationNumber,
+        violationType: violation.type,
+        description: violation.description,
+      },
+      sim.challans.length + 1
+    )
+  );
+  sim.logs.push(
+    `KERNEL VIOLATION ${violation.id}: ${violation.type} ${lane}, vehicle ${violation.vehicleId}, all-red +${additionalHoldSeconds}s`
+  );
   sim.finished = false;
   return true;
 }
@@ -313,7 +440,10 @@ function beginEmergencyClearance(sim: Sim, ambulance: Car) {
   sim.emergencyGreenElapsed = 0;
   sim.emergencyVehiclesReleased = 0;
   sim.emergencyAmbulancePassed = false;
-  sim.clearance = 1.5;
+  const clearanceDuration =
+    sim.safety.phase === "ALL_RED" ? Math.max(1.5, sim.safety.remaining) : 1.5;
+  sim.clearance = startAllRed(sim.safety, clearanceDuration);
+  sim.safety.pendingLane = null;
   sim.logs.push("ALL-RED clearance");
 }
 
@@ -329,7 +459,18 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
 
   if (sim.emergencyState === "CLEARING_TO_EMERGENCY") {
     sim.clearance = Math.max(0, sim.clearance - h);
+    sim.safety.remaining = sim.clearance;
+    if (sim.safety.allRedExtension > 0) advanceReleasedVehicles(sim, h);
     if (sim.clearance === 0) {
+      if (
+        sim.safety.allRedExtension > 0 &&
+        !applySafetyHold(sim.safety, junctionClear(sim), sim.logs)
+      ) {
+        // Clearance and the safety extension share one timer while the ambulance waits.
+      } else if (sim.safety.allRedExtension > 0) {
+        sim.clearance = sim.safety.remaining;
+        return;
+      }
       const ambulance = sim.cars.find((car) => car.id === sim.emergencyId);
       if (!ambulance) {
         sim.emergencyState = "IDLE";
@@ -337,6 +478,7 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
         return;
       }
       sim.emergencyState = "ACTIVE";
+      sim.safety.phase = "GREEN";
       startSlice(sim, ambulance.lane);
       sim.logs.push(`${ambulance.lane} GREEN (emergency)`);
     }
@@ -345,14 +487,14 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
 
   if (sim.emergencyState === "CLEARING_TO_NORMAL") {
     sim.clearance = Math.max(0, sim.clearance - h);
+    sim.safety.remaining = sim.clearance;
+    if (sim.safety.allRedExtension > 0) advanceReleasedVehicles(sim, h);
     if (sim.clearance === 0) {
       sim.emergencyState = "IDLE";
       sim.emergencyId = null;
       sim.logs.push("EMERGENCY cleared, resuming priority scheduling");
       sim.emergencyLane = null;
-      sim.safety.phase = "ALL_RED";
-      sim.safety.remaining = 2;
-      sim.safety.pendingLane = null;
+      sim.clearance = startAllRed(sim.safety, 2);
     }
     if (sim.emergencyState !== "IDLE") return;
   }
@@ -381,7 +523,11 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
 
     if (sim.safety.phase !== "GREEN") {
       advanceSafetyPhase(sim.safety, h);
-      if (sim.safety.phase === "ALL_RED" && sim.safety.remaining === 0) {
+      if (
+        sim.safety.phase === "ALL_RED" &&
+        sim.safety.remaining === 0 &&
+        !applySafetyHold(sim.safety, junctionClear(sim), sim.logs)
+      ) {
         const lane =
           sim.safety.pendingLane && queueLen(sim, sim.safety.pendingLane) > 0
             ? sim.safety.pendingLane
@@ -476,15 +622,18 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
   const remaining: Car[] = [];
   for (const c of sim.cars) {
     if (c.released) {
-      if (sim.emergencyState !== "IDLE" && c.lane !== sim.active) {
+      if (sim.emergencyState !== "IDLE" && c.lane !== sim.active && !c.rogue) {
         remaining.push(c);
         continue;
       }
       c.progress += CAR_SPEED * h;
       if (c.progress >= 100) {
-        sim.served++;
-        sim.waitSum += (c.releasedAt ?? sim.clock) - c.arrival;
-        sim.tatSum += sim.clock - c.arrival;
+        if (!c.rogue) {
+          // violators don't count in normal stats
+          sim.served++;
+          sim.waitSum += (c.releasedAt ?? sim.clock) - c.arrival;
+          sim.tatSum += sim.clock - c.arrival;
+        }
         continue; // left the canvas
       }
     }
@@ -518,7 +667,7 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
     endSlice(sim);
     sim.emergencyId = null;
     sim.emergencyState = "CLEARING_TO_NORMAL";
-    sim.clearance = 1.5;
+    sim.clearance = startAllRed(sim.safety, 1.5);
     sim.logs.push("ALL-RED clearance");
   }
 
@@ -547,6 +696,7 @@ export function step(sim: Sim, dt: number, algo: Algo, quantum: number, aging: b
 
 /** Plain-data copy for React state. */
 export function snapshot(sim: Sim) {
+  const violationLog = sim.violationLog.map((entry) => ({ ...entry }));
   return {
     clock: sim.clock,
     cars: sim.cars.map((c) => ({ ...c })),
@@ -587,6 +737,14 @@ export function snapshot(sim: Sim) {
       WEST: queueLen(sim, "WEST"),
     } as Record<Direction, number>,
     starvation: { ...sim.starvation },
+    violations: sim.violations,
+    challans: sim.challans.map((challan) => ({ ...challan })),
+    violationLog,
+    allRedExtension: sim.safety.allRedExtension,
+    junctionClear: junctionClear(sim),
+    safetyHoldActive:
+      sim.safety.phase === "ALL_RED" && sim.safety.allRedExtension > 0,
+    safetyHoldPending: sim.safety.pendingViolationExtension > 0,
     maxLaneWait: Math.max(
       0,
       ...DIRECTIONS.filter((d) => queueLen(sim, d) > 0 && sim.active !== d).map(
