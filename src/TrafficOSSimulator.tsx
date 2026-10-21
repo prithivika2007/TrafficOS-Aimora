@@ -206,8 +206,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
         ? "🟢 GREEN"
         : "🔴 RED";
     }
-    if (snap.active === lane) return "🟢 GREEN";
-    if (snap.clearing && snap.lastLane === lane) return "🟡 YELLOW";
+    if (snap.signalPhase === "GREEN" && snap.active === lane) return "🟢 GREEN";
+    if (snap.signalPhase === "YELLOW" && snap.lastLane === lane) return "🟡 YELLOW";
     return "🔴 RED";
   };
 
@@ -267,6 +267,20 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
           <div className="text-xs">
             <span className="text-slate-500 mr-2">CLOCK:</span>
             <span className="text-cyan-400 font-bold">{snap.clock.toFixed(1)}s</span>
+          </div>
+          <div className="text-xs">
+            <span className="text-slate-500 mr-2">SIGNAL:</span>
+            <span
+              className={`font-bold ${
+                snap.signalPhase === "GREEN"
+                  ? "text-emerald-400"
+                  : snap.signalPhase === "YELLOW"
+                  ? "text-amber-300"
+                  : "text-rose-400"
+              }`}
+            >
+              {snap.signalPhase} · {snap.phaseRemaining.toFixed(1)}s
+            </span>
           </div>
           <div className="flex items-center gap-2 text-xs">
             <span className="text-slate-500">STATE:</span>

@@ -2,8 +2,24 @@
  * TrafficOS simulation engine (pure TypeScript, no React).
  *
  * Mapping:  lane = process,  vehicle = unit of CPU work,  green light = CPU,
- *           quantum = green-slice length,  all-red gap = context switch.
+ *           junction = critical section, mutex = exclusive green access,
+ *           context switch = signal transition between lane processes.
  */
+
+import {
+  activateGreen,
+  advanceSafetyPhase,
+  approveGreenSwitch,
+  beginSafetySwitch,
+  createSafetyState,
+  MAX_GREEN_SECONDS,
+  MIN_GREEN_SECONDS,
+  STARVATION_LIMIT_SECONDS,
+} from "./safetyLayer";
+import type {
+  SafetyState,
+  SignalPhase,
+} from "./safetyLayer";
 
 export type Direction = "NORTH" | "EAST" | "SOUTH" | "WEST";
 export type Algo = "RR" | "PRIORITY_AGING";
@@ -59,7 +75,9 @@ export interface Sim {
   lastLane: Direction | null;
   rrPtr: number;
   waitSince: Record<Direction, number>;
+  starvation: Record<Direction, number>;
   priority: Record<Direction, number>;
+  safety: SafetyState;
   segments: Segment[];
   contextSwitches: number;
   served: number;
@@ -137,12 +155,14 @@ export function createSim(
     lastLane: null,
     rrPtr: -1,
     waitSince: { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 },
+    starvation: { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 },
     priority: {
       NORTH: setup.NORTH.priority,
       EAST: setup.EAST.priority,
       SOUTH: setup.SOUTH.priority,
       WEST: setup.WEST.priority,
     },
+    safety: createSafetyState(),
     segments: [],
     contextSwitches: 0,
     served: 0,
@@ -221,6 +241,11 @@ export const effectivePriority = (sim: Sim, lane: Direction, aging: boolean): nu
 export function pickLane(sim: Sim, algo: Algo, aging: boolean): Direction | null {
   const cands = DIRECTIONS.filter((d) => queueLen(sim, d) > 0);
   if (cands.length === 0) return null;
+
+  const starved = cands
+    .filter((lane) => sim.starvation[lane] >= STARVATION_LIMIT_SECONDS)
+    .sort((a, b) => sim.starvation[b] - sim.starvation[a]);
+  if (starved.length > 0) return starved[0];
 
   switch (algo) {
     case "RR": {
@@ -325,6 +350,9 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
       sim.emergencyId = null;
       sim.logs.push("EMERGENCY cleared, resuming priority scheduling");
       sim.emergencyLane = null;
+      sim.safety.phase = "ALL_RED";
+      sim.safety.remaining = 2;
+      sim.safety.pendingLane = null;
     }
     if (sim.emergencyState !== "IDLE") return;
   }
@@ -337,21 +365,52 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
     }
   }
 
-  // 1) All-red gap, then dispatch.
-  if (sim.active === null) {
-    if (sim.clearance > 0) sim.clearance -= h;
-    if (sim.clearance <= 0) {
-      sim.clearance = 0;
-      const lane = pickLane(sim, algo, aging);
-      if (lane) startSlice(sim, lane);
+  if (sim.emergencyState === "IDLE") {
+    // Emergency preemption can interrupt a normal green; resume through all-red.
+    if (sim.active === null && sim.safety.phase === "GREEN") {
+      sim.safety.phase = "ALL_RED";
+      sim.safety.remaining = 2;
+      sim.safety.pendingLane = null;
+    }
+
+    for (const lane of DIRECTIONS) {
+      if (queueLen(sim, lane) > 0 && sim.active !== lane) {
+        sim.starvation[lane] += h;
+      }
+    }
+
+    if (sim.safety.phase !== "GREEN") {
+      advanceSafetyPhase(sim.safety, h);
+      if (sim.safety.phase === "ALL_RED" && sim.safety.remaining === 0) {
+        const lane =
+          sim.safety.pendingLane && queueLen(sim, sim.safety.pendingLane) > 0
+            ? sim.safety.pendingLane
+            : pickLane(sim, algo, aging);
+        if (lane && approveGreenSwitch(sim.safety, sim.active, lane, sim.logs)) {
+          startSlice(sim, lane);
+          sim.starvation[lane] = 0;
+          activateGreen(sim.safety);
+          sim.logs.push(`${lane} GREEN`);
+        } else if (lane) {
+          sim.safety.pendingLane = null;
+          sim.safety.remaining = 2;
+        }
+      }
     }
   }
 
-  // 2) Run the current green slice.
-  if (sim.active) {
+  // Normal green access is granted only by the safety controller; emergency behavior stays unchanged.
+  if (
+    (sim.emergencyState === "ACTIVE" || sim.safety.phase === "GREEN") &&
+    sim.active
+  ) {
     const lane = sim.active;
     sim.sliceElapsed += h;
     sim.releaseTimer += h;
+    if (sim.emergencyState === "IDLE") {
+      sim.safety.greenElapsed += h;
+      sim.safety.remaining = Math.max(0, MAX_GREEN_SECONDS - sim.safety.greenElapsed);
+    }
 
     if (sim.emergencyState === "ACTIVE") {
       sim.emergencyGreenElapsed += h;
@@ -380,7 +439,7 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
     } else {
       const preemptive = algo === "RR" || algo === "PRIORITY_AGING";
       const expired = preemptive && sim.sliceElapsed >= quantum - 1e-9;
-      if (!expired) {
+      if (!expired || sim.safety.greenElapsed < MIN_GREEN_SECONDS) {
         while (sim.releaseTimer >= HEADWAY - 1e-9 && queueLen(sim, lane) > 0) {
           const head = queueOf(sim, lane)[0];
           head.released = true;
@@ -390,11 +449,18 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
       }
       // A lane is only "done" once its last vehicle has had its full service time (HEADWAY) on green.
       const empty = queueLen(sim, lane) === 0 && sim.releaseTimer >= HEADWAY - 1e-9;
-      if (expired || empty) {
-        endSlice(sim);
+      const maxGreenReached = sim.safety.greenElapsed >= MAX_GREEN_SECONDS - 1e-9;
+      if (
+        maxGreenReached ||
+        ((expired || empty) && sim.safety.greenElapsed >= MIN_GREEN_SECONDS)
+      ) {
         const next = pickLane(sim, algo, aging);
-        if (next === lane) startSlice(sim, lane); // same lane keeps going: no context switch
-        else if (next !== null) sim.clearance = CLEARANCE;
+        if (next === lane && !empty && !maxGreenReached) {
+          sim.sliceElapsed = 0;
+        } else {
+          endSlice(sim);
+          beginSafetySwitch(sim.safety, next);
+        }
       }
     }
   }
@@ -457,7 +523,13 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
   }
 
   // 4) Done?
-  if (sim.cars.length === 0 && sim.active === null && sim.emergencyState === "IDLE") {
+  if (
+    sim.cars.length === 0 &&
+    sim.active === null &&
+    sim.emergencyState === "IDLE" &&
+    sim.safety.phase === "ALL_RED" &&
+    sim.safety.remaining === 0
+  ) {
     sim.finished = true;
   }
 }
@@ -479,7 +551,26 @@ export function snapshot(sim: Sim) {
     clock: sim.clock,
     cars: sim.cars.map((c) => ({ ...c })),
     active: sim.active,
-    clearing: sim.active === null && sim.clearance > 0,
+    clearing:
+      sim.emergencyState === "CLEARING_TO_EMERGENCY" ||
+      sim.emergencyState === "CLEARING_TO_NORMAL" ||
+      sim.safety.phase === "YELLOW" ||
+      sim.safety.phase === "ALL_RED",
+    signalPhase: (
+      sim.emergencyState === "CLEARING_TO_EMERGENCY" ||
+      sim.emergencyState === "CLEARING_TO_NORMAL"
+        ? "ALL_RED"
+        : sim.emergencyState === "ACTIVE"
+        ? "GREEN"
+        : sim.safety.phase
+    ) as SignalPhase,
+    phaseRemaining:
+      sim.emergencyState === "CLEARING_TO_EMERGENCY" ||
+      sim.emergencyState === "CLEARING_TO_NORMAL"
+        ? sim.clearance
+        : sim.emergencyState === "ACTIVE"
+        ? Math.max(0, 8 - sim.emergencyGreenElapsed)
+        : sim.safety.remaining,
     lastLane: sim.lastLane,
     emergencyState: sim.emergencyState,
     segments: sim.segments.map((s) => ({ ...s })),
@@ -495,6 +586,7 @@ export function snapshot(sim: Sim) {
       SOUTH: queueLen(sim, "SOUTH"),
       WEST: queueLen(sim, "WEST"),
     } as Record<Direction, number>,
+    starvation: { ...sim.starvation },
     maxLaneWait: Math.max(
       0,
       ...DIRECTIONS.filter((d) => queueLen(sim, d) > 0 && sim.active !== d).map(
