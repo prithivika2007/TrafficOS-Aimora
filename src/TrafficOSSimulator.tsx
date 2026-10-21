@@ -14,12 +14,15 @@ import {
   presetSetup,
   snapshot,
   step,
+  addEmergencyVehicle,
   addRogueVehicle,
   checkSimulationWatchdog,
   setSimulationDataStale,
 } from "./simEngine";
 import type { EChallan } from "./eChallan";
 import { WATCHDOG_POLL_INTERVAL_MS } from "./safetyLayer";
+import AmbulanceLabPanel from "./components/AmbulanceLabPanel";
+import type { AmbulanceScenario } from "./components/AmbulanceLabPanel";
 
 interface TrafficOSSimulatorProps {
   simulationRef: MutableRefObject<Sim>;
@@ -37,10 +40,10 @@ const LANE_DOT: Record<Direction, string> = {
   WEST: "bg-amber-500 shadow-lg shadow-amber-500/50",
 };
 const LANE_COLOR: Record<Direction, string> = {
-  NORTH: "#f43f5e",
-  EAST: "#3b82f6",
-  SOUTH: "#a855f7",
-  WEST: "#f59e0b",
+  NORTH: "#facc15",
+  EAST: "#22d3ee",
+  SOUTH: "#f8fafc",
+  WEST: "#fbbf24",
 };
 const LANE_SHORT: Record<Direction, string> = { NORTH: "N", EAST: "E", SOUTH: "S", WEST: "W" };
 const CAR_ROTATION: Record<Direction, number> = {
@@ -74,6 +77,7 @@ interface BenchmarkReading {
   avgWait: number;
   served: number;
   contextSwitches: number;
+  throughput: number;
 }
 
 interface FrozenBenchmark {
@@ -117,6 +121,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [emergencyLane, setEmergencyLane] = useState<Direction | null>(null);
   const [dashboardTab, setDashboardTab] = useState<DashboardTab>("SAFETY");
   const [selectedChallan, setSelectedChallan] = useState<EChallan | null>(null);
+  const [ambulanceScenario, setAmbulanceScenario] = useState<AmbulanceScenario>("IDLE");
+  const repeatedArrivalLaneRef = useRef(0);
 
   const localSimRef = useRef<Sim>(createSim(setup, selectedAlgo, emergencyLane));
   const simRef = simulationRef ?? localSimRef;
@@ -127,7 +133,23 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [running, setRunning] = useState<boolean>(false);
   const [stopped, setStopped] = useState<boolean>(false);
   const [frozenBenchmark, setFrozenBenchmark] = useState<FrozenBenchmark | null>(null);
+  const [reportActionError, setReportActionError] = useState<string | null>(null);
+  const [reportActionNotice, setReportActionNotice] = useState<string | null>(null);
   const benchmarkFrozenRef = useRef(false);
+
+  useEffect(() => {
+    if (ambulanceScenario !== "REPEATED" || !running) return;
+    const lanes: Direction[] = ["EAST", "WEST", "NORTH", "SOUTH"];
+    const timer = window.setInterval(() => {
+      if (benchmarkFrozenRef.current || simRef.current.finished) return;
+      const lane = lanes[repeatedArrivalLaneRef.current % lanes.length];
+      repeatedArrivalLaneRef.current += 1;
+      if (addEmergencyVehicle(simRef.current, lane)) {
+        setSnap(snapshot(simRef.current));
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [ambulanceScenario, running, simRef]);
 
   const advanceBenchmarks = (dt: number, quantum: number, activeAlgo: BenchmarkAlgo) => {
     const benchmarkAlgos = new Set<BenchmarkAlgo>(["STATIC", activeAlgo]);
@@ -230,6 +252,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             : 0,
           served: benchmarkSim.served,
           contextSwitches: benchmarkSim.contextSwitches,
+          throughput: elapsed > 0 ? (benchmarkSim.served / elapsed) * 60 : 0,
         }];
       });
     return { status, elapsed, readings };
@@ -244,7 +267,84 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const clearFrozenBenchmark = () => {
     benchmarkFrozenRef.current = false;
     setFrozenBenchmark(null);
+    setReportActionError(null);
+    setReportActionNotice(null);
     setStopped(false);
+  };
+
+  const exportFrozenReport = (format: "json" | "csv") => {
+    if (!frozenBenchmark) return;
+    const report = {
+      freezeTimeSeconds: frozenBenchmark.elapsed,
+      activeAlgorithm: selectedAlgo,
+      activeAlgorithmLabel: activeAlgoLabel,
+      status: frozenBenchmark.status,
+      staticTimers: frozenStaticBenchmark
+        ? {
+            averageWaitSeconds: frozenStaticBenchmark.avgWait,
+            vehiclesServed: frozenStaticBenchmark.served,
+            throughputVehiclesPerMinute: frozenStaticBenchmark.throughput,
+            contextSwitches: frozenStaticBenchmark.contextSwitches,
+          }
+        : null,
+      activeScheduler: frozenActiveBenchmark
+        ? {
+            averageWaitSeconds: frozenActiveBenchmark.avgWait,
+            vehiclesServed: frozenActiveBenchmark.served,
+            throughputVehiclesPerMinute: frozenActiveBenchmark.throughput,
+            contextSwitches: frozenActiveBenchmark.contextSwitches,
+          }
+        : null,
+      delaySavedPerCarSeconds: frozenDelaySavings,
+      efficiencyGainPercent: frozenEfficiencyGain,
+      conclusion: frozenConclusion,
+    };
+    const content =
+      format === "json"
+        ? JSON.stringify(report, null, 2)
+        : [
+            "freezeTimeSeconds,activeAlgorithm,staticAverageWaitSeconds,activeAverageWaitSeconds,delaySavedPerCarSeconds,efficiencyGainPercent,vehiclesServed,throughputVehiclesPerMinute,contextSwitches",
+            [
+              frozenBenchmark.elapsed.toFixed(2),
+              `"${activeAlgoLabel}"`,
+              frozenStaticBenchmark?.avgWait.toFixed(2) ?? "",
+              frozenActiveBenchmark?.avgWait.toFixed(2) ?? "",
+              frozenDelaySavings?.toFixed(2) ?? "",
+              frozenEfficiencyGain?.toFixed(2) ?? "",
+              frozenActiveBenchmark?.served ?? "",
+              frozenActiveBenchmark?.throughput.toFixed(2) ?? "",
+              frozenActiveBenchmark?.contextSwitches ?? "",
+            ].join(","),
+          ].join("\n");
+    const blob = new Blob([content], {
+      type: format === "json" ? "application/json" : "text/csv",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `trafficos-benchmark-${frozenBenchmark.elapsed.toFixed(1)}s.${format}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setReportActionError(null);
+    setReportActionNotice(`Report export started (${format.toUpperCase()}).`);
+  };
+
+  const copyFrozenSummary = async () => {
+    if (!frozenConclusion) return;
+    try {
+      await navigator.clipboard.writeText(frozenConclusion);
+      setReportActionError(null);
+      setReportActionNotice("Summary copied to clipboard.");
+    } catch (error) {
+      setReportActionNotice(null);
+      setReportActionError(
+        `Could not copy report summary: ${
+          error instanceof Error ? error.message : "clipboard access was denied"
+        }`
+      );
+    }
   };
 
   const totalVehicles =
@@ -253,6 +353,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const reset = () => {
     setRunning(false);
+    setAmbulanceScenario("IDLE");
     clearFrozenBenchmark();
     setSelectedChallan(null);
     const nextSetup = presetSetup(selectedAlgo);
@@ -317,16 +418,46 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     setSnap(snapshot(simRef.current));
   };
 
-  const injectAmbulance = () => {
-    if (!running || benchmarkFrozenRef.current) return;
-    const lane = emergencyLane ?? "SOUTH";
-    if (addVehicle(simRef.current, lane, true)) {
-      benchmarkSimsRef.current.STATIC && addVehicle(benchmarkSimsRef.current.STATIC, lane, true);
-      benchmarkSimsRef.current.PRIORITY_AGING &&
-        addVehicle(benchmarkSimsRef.current.PRIORITY_AGING, lane, true);
-      setSnap(snapshot(simRef.current));
+  const launchEmergencyScenario = (lanes: Direction[]) => {
+    clearFrozenBenchmark();
+    if (simRef.current.finished) {
+      simRef.current = createSim(setup, selectedAlgo);
+      benchmarkSimsRef.current = createBenchmarkSims(setup, selectedAlgo, null);
     }
+    setStopped(false);
+    lanes.forEach((lane) => addEmergencyVehicle(simRef.current, lane));
+    setSnap(snapshot(simRef.current));
+    setRunning(true);
   };
+
+  const startSingleAmbulance = () => {
+    setAmbulanceScenario("SINGLE");
+    launchEmergencyScenario([emergencyLane ?? "SOUTH"]);
+  };
+
+  const startRepeatedArrivals = () => {
+    repeatedArrivalLaneRef.current = 0;
+    setAmbulanceScenario("REPEATED");
+    launchEmergencyScenario([emergencyLane ?? "SOUTH"]);
+  };
+
+  const startConflictingRequests = () => {
+    setAmbulanceScenario("CONFLICTING");
+    launchEmergencyScenario(["NORTH", "EAST"]);
+  };
+
+  const resetAmbulanceLab = () => {
+    setRunning(false);
+    setAmbulanceScenario("IDLE");
+    setEmergencyLane(null);
+    clearFrozenBenchmark();
+    const cleanSim = createSim(setup, selectedAlgo);
+    simRef.current = cleanSim;
+    benchmarkSimsRef.current = createBenchmarkSims(setup, selectedAlgo, null);
+    setSnap(snapshot(cleanSim));
+  };
+
+  const injectAmbulance = () => startSingleAmbulance();
 
   const toggleSimulatedStaleData = () => {
     setSimulationDataStale(
@@ -340,21 +471,23 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     setSetup((prev) => ({ ...prev, [lane]: { ...prev[lane], ...patch } }));
 
   const getVehicleStyle = (lane: Direction, progress: number) => {
+    const visibleProgress = Math.min(95, Math.max(5, 5 + progress * 0.9));
     switch (lane) {
       case "NORTH":
-        return { top: `${progress}%`, left: "48%" };
+        return { top: `${visibleProgress}%`, left: "48%" };
       case "SOUTH":
-        return { bottom: `${progress}%`, left: "52%" };
+        return { bottom: `${visibleProgress}%`, left: "52%" };
       case "EAST":
-        return { right: `${progress}%`, top: "48%" };
+        return { right: `${visibleProgress}%`, top: "48%" };
       case "WEST":
-        return { left: `${progress}%`, top: "52%" };
+        return { left: `${visibleProgress}%`, top: "52%" };
     }
   };
 
   const handleAlgoChange = (algo: Algo) => {
     const nextSetup = presetSetup(algo);
     setRunning(false);
+    setAmbulanceScenario("IDLE");
     clearFrozenBenchmark();
     setSelectedAlgo(algo);
     setSetup(nextSetup);
@@ -366,10 +499,30 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   };
 
   const hasAmbulance = (lane: Direction) =>
-    snap.cars.some((car) => car.emergency && car.lane === lane);
+    snap.emergencyVehicles.some(
+      (vehicle) =>
+        vehicle.lane === lane &&
+        vehicle.status !== "CLEARED" &&
+        vehicle.status !== "RECOVERY"
+    );
+
+  const inTransitByLane = DIRECTIONS.reduce<Record<Direction, number>>(
+    (counts, lane) => {
+      counts[lane] = snap.cars.filter((car) => car.lane === lane && car.released).length;
+      return counts;
+    },
+    { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 }
+  );
 
   const signalOf = (lane: Direction) => {
     if (snap.emergencyState !== "IDLE") {
+      if (
+        snap.emergencyState === "CLEARING_TO_EMERGENCY" &&
+        snap.signalPhase === "YELLOW" &&
+        snap.lastLane === lane
+      ) {
+        return "🟡 AMBER";
+      }
       return snap.emergencyState === "ACTIVE" && snap.active === lane
         ? "🟢 GREEN"
         : "🔴 RED";
@@ -399,7 +552,11 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
         ? benchmarkSim.waitSum / benchmarkSim.served
         : 0,
       served: benchmarkSim?.served ?? 0,
-        contextSwitches: benchmarkSim?.contextSwitches ?? 0,
+      contextSwitches: benchmarkSim?.contextSwitches ?? 0,
+      throughput:
+        benchmarkSim && simRef.current.clock > 0
+          ? (benchmarkSim.served / simRef.current.clock) * 60
+          : 0,
     };
   });
   const benchmarkSnapshots = frozenBenchmark?.readings ?? liveBenchmarkSnapshots;
@@ -446,9 +603,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
       ? (frozenDelaySavings / frozenStaticBenchmark.avgWait) * 100
       : null;
   const frozenThroughput =
-    frozenBenchmark && frozenActiveBenchmark && frozenBenchmark.elapsed > 0
-      ? (frozenActiveBenchmark.served / frozenBenchmark.elapsed) * 60
-      : 0;
+    frozenActiveBenchmark?.throughput ?? 0;
   const frozenSwitchLabel =
     frozenActiveBenchmark?.contextSwitches === 1 ? "context switch" : "context switches";
   const benchmarkStatusLabel = frozenBenchmark
@@ -457,19 +612,33 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     ? `LIVE BENCHMARK • ${snap.clock.toFixed(1)}s`
     : "READY";
   const frozenConclusion =
-    frozenBenchmark && selectedAlgo !== "STATIC"
-      ? frozenDelaySavings === null ||
-        !frozenStaticBenchmark ||
-        !frozenActiveBenchmark
-        ? `Final analysis captured at ${frozenBenchmark.elapsed.toFixed(1)}s. Not enough served vehicles in both runs to calculate a reliable comparison.`
-        : frozenDelaySavings > 0
-        ? `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers averaged ${frozenStaticBenchmark.avgWait.toFixed(2)}s of wait per car, while ${activeAlgoLabel} averaged ${frozenActiveBenchmark.avgWait.toFixed(2)}s. Average wait fell by ${frozenDelaySavings.toFixed(2)}s per car (${frozenEfficiencyGain?.toFixed(1)}%). The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`
-        : frozenDelaySavings < 0
-        ? `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers averaged ${frozenStaticBenchmark.avgWait.toFixed(2)}s of wait per car, while ${activeAlgoLabel} averaged ${frozenActiveBenchmark.avgWait.toFixed(2)}s. Average wait increased by ${Math.abs(frozenDelaySavings).toFixed(2)}s per car (${Math.abs(frozenEfficiencyGain ?? 0).toFixed(1)}%) in this run. The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`
-        : `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers and ${activeAlgoLabel} matched at ${frozenStaticBenchmark.avgWait.toFixed(2)}s average wait per car. The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`
+    frozenBenchmark && selectedAlgo !== "STATIC" && frozenStaticBenchmark && frozenActiveBenchmark
+      ? (() => {
+          const efficiencyText =
+            frozenDelaySavings === null
+              ? "No vehicles completed in both runs, so an efficiency comparison is not measurable"
+              : frozenDelaySavings > 0
+              ? `Average wait decreased by ${frozenDelaySavings.toFixed(2)}s per car (${frozenEfficiencyGain?.toFixed(1)}%)`
+              : frozenDelaySavings < 0
+              ? `Average wait increased by ${Math.abs(frozenDelaySavings).toFixed(2)}s per car (${Math.abs(frozenEfficiencyGain ?? 0).toFixed(1)}%)`
+              : "Average wait was unchanged (0.0% efficiency gain)";
+          return `At ${frozenBenchmark.elapsed.toFixed(1)}s, Static Timers averaged ${frozenStaticBenchmark.avgWait.toFixed(2)}s of wait per car, while ${activeAlgoLabel} averaged ${frozenActiveBenchmark.avgWait.toFixed(2)}s. ${efficiencyText} in this run. The active run served ${frozenActiveBenchmark.served} vehicles at ${frozenThroughput.toFixed(1)} vehicles/min and recorded ${frozenActiveBenchmark.contextSwitches} ${frozenSwitchLabel}.`;
+        })()
       : frozenBenchmark
       ? "Static Timers is the selected baseline. Select Round Robin or Priority + Dynamic Aging to generate a comparative efficiency report."
       : null;
+  const efficiencyTone =
+    efficiencyGain === null
+      ? "border-slate-300 bg-slate-100 text-slate-600"
+      : efficiencyGain >= 0
+      ? "border-emerald-300 bg-emerald-500/10 text-emerald-700"
+      : "border-rose-300 bg-rose-500/10 text-rose-700";
+  const delayTone =
+    efficiencyGain === null
+      ? "border-slate-300 bg-slate-100 text-slate-600"
+      : efficiencyGain >= 0
+      ? "border-emerald-300 bg-emerald-500/10 text-emerald-700"
+      : "border-rose-300 bg-rose-500/10 text-rose-700";
 
   const selectCls =
     "w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all disabled:opacity-50";
@@ -1011,24 +1180,25 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             </div>
 
             {/* Signal Labels */}
-            <div className="absolute top-3 left-4 text-[11px] font-bold tracking-wide text-slate-300 bg-slate-900/80 px-2.5 py-1 rounded-lg border border-slate-800">
-              NORTH: {signalOf("NORTH")} {hasAmbulance("NORTH") && <span className="text-rose-400 animate-pulse font-extrabold">🚨 EMERGENCY</span>}
+            <div className="absolute top-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
+              NORTH: {signalOf("NORTH")} · {snap.queued.NORTH} QUEUED · {inTransitByLane.NORTH} MOVING {hasAmbulance("NORTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
-            <div className="absolute bottom-3 left-4 text-[11px] font-bold tracking-wide text-slate-300 bg-slate-900/80 px-2.5 py-1 rounded-lg border border-slate-800">
-              SOUTH: {signalOf("SOUTH")} {hasAmbulance("SOUTH") && <span className="text-rose-400 animate-pulse font-extrabold">🚨 EMERGENCY</span>}
+            <div className="absolute bottom-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
+              SOUTH: {signalOf("SOUTH")} · {snap.queued.SOUTH} QUEUED · {inTransitByLane.SOUTH} MOVING {hasAmbulance("SOUTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
-            <div className="absolute left-3 top-16 text-[11px] font-bold tracking-wide text-slate-300 bg-slate-900/80 px-2.5 py-1 rounded-lg border border-slate-800">
-              WEST: {signalOf("WEST")} {hasAmbulance("WEST") && <span className="text-rose-400 animate-pulse font-extrabold">🚨 EMERGENCY</span>}
+            <div className="absolute left-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
+              WEST: {signalOf("WEST")} · {snap.queued.WEST} QUEUED · {inTransitByLane.WEST} MOVING {hasAmbulance("WEST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
-            <div className="absolute right-3 top-16 text-[11px] font-bold tracking-wide text-slate-300 bg-slate-900/80 px-2.5 py-1 rounded-lg border border-slate-800">
-              EAST: {signalOf("EAST")} {hasAmbulance("EAST") && <span className="text-rose-400 animate-pulse font-extrabold">🚨 EMERGENCY</span>}
+            <div className="absolute right-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
+              EAST: {signalOf("EAST")} · {snap.queued.EAST} QUEUED · {inTransitByLane.EAST} MOVING {hasAmbulance("EAST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
 
             {/* Moving Vehicles */}
             {snap.cars.map((v) => (
               <div
                 key={v.id}
-                className="absolute w-4 h-6 transition-all duration-75"
+                aria-label={`${v.emergency ? "Emergency vehicle" : `${v.lane} lane vehicle`} ${v.released ? "in transit" : "queued"}`}
+                className="absolute z-[2] h-6 w-4 transition-[top,right,bottom,left] duration-75 ease-linear will-change-[top,left,right,bottom]"
                 style={{
                   ...getVehicleStyle(v.lane, v.progress),
                   transform: "translate(-50%, -50%)",
@@ -1064,6 +1234,28 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                 )}
               </div>
             ))}
+            {snap.emergencyVehicles
+              .filter((vehicle) => vehicle.status !== "CLEARED" && vehicle.position < 100)
+              .map((vehicle) => (
+                <div
+                  key={vehicle.id}
+                  aria-label={`${vehicle.id} emergency vehicle on ${vehicle.lane}`}
+                  className="absolute z-[3] h-7 w-7 transition-[top,right,bottom,left] duration-75 ease-linear will-change-[top,left,right,bottom]"
+                  style={{
+                    ...getVehicleStyle(vehicle.lane, vehicle.position),
+                    transform: "translate(-50%, -50%)",
+                  }}
+                >
+                  <div
+                    className="relative flex h-full w-full items-center justify-center rounded-lg border border-white/90 bg-rose-600 text-base shadow-[0_0_16px_rgba(244,63,94,0.8)]"
+                    style={{ transform: `rotate(${CAR_ROTATION[vehicle.lane]}deg)` }}
+                  >
+                    🚑
+                    <span className="absolute left-1 top-0.5 h-1.5 w-1.5 animate-ping rounded-full bg-white" />
+                    <span className="absolute right-1 top-0.5 h-1.5 w-1.5 animate-ping rounded-full bg-cyan-300" />
+                  </div>
+                </div>
+              ))}
           </div>
 
           {/* Circular Queue Traversal Grid */}
@@ -1156,8 +1348,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                   Average vehicle wait · only the selected scheduler is replayed against the static baseline
                 </p>
               </div>
-              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[10px] font-black uppercase tracking-wider ${frozenBenchmark ? "border-slate-400 bg-slate-200 text-slate-900" : running ? "border-emerald-300 bg-emerald-100 text-emerald-900" : "border-amber-300 bg-amber-100 text-amber-900"}`}>
-                <span className="h-2 w-2 rounded-full bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.6)]" />
+              <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[10px] font-black tracking-wider transition-all duration-500 ${frozenBenchmark ? "animate-pulse border-amber-400 bg-amber-100 text-slate-900 shadow-[0_0_22px_rgba(245,158,11,0.35)]" : running ? "border-emerald-300 bg-emerald-100 text-emerald-900 uppercase" : "border-amber-300 bg-amber-100 text-amber-900 uppercase"}`}>
+                <span className={`h-2 w-2 rounded-full shadow-[0_0_10px_rgba(245,158,11,0.6)] ${frozenBenchmark ? "bg-amber-500" : running ? "bg-emerald-500" : "bg-amber-500"}`} />
                 {benchmarkStatusLabel}
               </span>
             </div>
@@ -1229,19 +1421,19 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                 </p>
               </div>
               <div className="grid grid-cols-2 gap-2 sm:min-w-[260px]">
-                <div className={`rounded-xl border px-3 py-2.5 shadow-[0_8px_24px_rgba(16,185,129,0.12)] ${delaySavings === null || delaySavings >= 0 ? "border-emerald-300 bg-emerald-50" : "border-rose-300 bg-rose-50 shadow-[0_8px_24px_rgba(244,63,94,0.12)]"}`}>
-                  <span className={`block text-[10px] font-bold uppercase tracking-wider ${delaySavings === null || delaySavings >= 0 ? "text-emerald-900" : "text-rose-900"}`}>
+                <div className={`rounded-xl border px-3 py-2.5 shadow-[0_8px_24px_rgba(16,185,129,0.12)] ${delayTone}`}>
+                  <span className="block text-[10px] font-bold uppercase tracking-wider">
                     Delay saved / car
                   </span>
-                  <span className={`mt-1 block font-sans text-xl font-black tabular-nums ${delaySavings === null || delaySavings >= 0 ? "text-emerald-800" : "text-rose-800"}`}>
+                  <span className="mt-1 block font-sans text-xl font-black tabular-nums">
                     {delaySavings === null ? "—" : `${delaySavings.toFixed(2)}s`}
                   </span>
                 </div>
-                <div className={`rounded-xl border px-3 py-2.5 shadow-[0_8px_24px_rgba(16,185,129,0.12)] ${efficiencyGain === null || efficiencyGain >= 0 ? "border-emerald-300 bg-emerald-50" : "border-rose-300 bg-rose-50 shadow-[0_8px_24px_rgba(244,63,94,0.12)]"}`}>
-                  <span className={`block text-[10px] font-bold uppercase tracking-wider ${efficiencyGain === null || efficiencyGain >= 0 ? "text-emerald-900" : "text-rose-900"}`}>
+                <div className={`rounded-xl border px-3 py-2.5 shadow-[0_8px_24px_rgba(16,185,129,0.12)] ${efficiencyTone}`}>
+                  <span className="block text-[10px] font-bold uppercase tracking-wider">
                     Efficiency gain
                   </span>
-                  <span className={`mt-1 block font-sans text-xl font-black tabular-nums ${efficiencyGain === null || efficiencyGain >= 0 ? "text-emerald-800" : "text-rose-800"}`}>
+                  <span className="mt-1 block font-sans text-xl font-black tabular-nums">
                     {efficiencyGain === null ? "—" : `${efficiencyGain.toFixed(1)}%`}
                   </span>
                 </div>
@@ -1254,6 +1446,46 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                   <p className="mt-2 text-sm font-semibold leading-relaxed text-slate-800">
                     {frozenConclusion}
                   </p>
+                  <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-200 pt-3">
+                    <button
+                      type="button"
+                      onClick={() => void copyFrozenSummary()}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-[11px] font-bold text-slate-800 transition-colors hover:border-amber-400 hover:bg-amber-50"
+                    >
+                      📋 Copy Summary Text
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => exportFrozenReport("json")}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-[11px] font-bold text-slate-800 transition-colors hover:border-amber-400 hover:bg-amber-50"
+                    >
+                      📥 Export Report (JSON)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => exportFrozenReport("csv")}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-[11px] font-bold text-slate-800 transition-colors hover:border-amber-400 hover:bg-amber-50"
+                    >
+                      Export CSV
+                    </button>
+                    <button
+                      type="button"
+                      onClick={reset}
+                      className="rounded-lg border border-amber-300 bg-amber-100 px-3 py-2 text-[11px] font-black text-amber-950 transition-colors hover:bg-amber-200"
+                    >
+                      🔄 Reset &amp; Replay
+                    </button>
+                  </div>
+                  {reportActionError && (
+                    <p role="alert" className="mt-2 text-xs font-bold text-rose-700">
+                      {reportActionError}
+                    </p>
+                  )}
+                  {reportActionNotice && (
+                    <p aria-live="polite" className="mt-2 text-xs font-bold text-emerald-700">
+                      {reportActionNotice}
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -1266,6 +1498,16 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             )}
           </section>
         </div>
+      </div>
+      <div className="mt-6">
+        <AmbulanceLabPanel
+          snapshot={snap}
+          scenario={ambulanceScenario}
+          onSingleAmbulance={startSingleAmbulance}
+          onRepeatedArrivals={startRepeatedArrivals}
+          onConflictingRequests={startConflictingRequests}
+          onReset={resetAmbulanceLab}
+        />
       </div>
     </div>
   );
