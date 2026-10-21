@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import type { MutableRefObject } from "react";
 import {
   Algo,
   Direction,
@@ -14,10 +15,15 @@ import {
   snapshot,
   step,
   addRogueVehicle,
+  checkSimulationWatchdog,
+  setSimulationDataStale,
 } from "./simEngine";
 import type { EChallan } from "./eChallan";
+import { WATCHDOG_POLL_INTERVAL_MS } from "./safetyLayer";
 
 interface TrafficOSSimulatorProps {
+  simulationRef: MutableRefObject<Sim>;
+  simulationRevision: number;
   initialAlgoConfig?: {
     algo?: string;
     quantum?: number;
@@ -61,6 +67,8 @@ type Phase = "IDLE" | "RUNNING" | "PAUSED" | "COMPLETED";
 type DashboardTab = "SAFETY" | "E_CHALLANS";
 
 export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
+  simulationRef,
+  simulationRevision,
   initialAlgoConfig,
 }) => {
   const initialAlgo: Algo = isAlgo(initialAlgoConfig?.algo)
@@ -76,7 +84,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [dashboardTab, setDashboardTab] = useState<DashboardTab>("SAFETY");
   const [selectedChallan, setSelectedChallan] = useState<EChallan | null>(null);
 
-  const simRef = useRef<Sim>(createSim(setup, selectedAlgo, emergencyLane));
+  const localSimRef = useRef<Sim>(createSim(setup, selectedAlgo, emergencyLane));
+  const simRef = simulationRef ?? localSimRef;
   const [snap, setSnap] = useState<Snapshot>(() => snapshot(simRef.current));
   const [running, setRunning] = useState<boolean>(false);
 
@@ -106,6 +115,10 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   }, [setup, selectedAlgo, emergencyLane]);
 
   useEffect(() => {
+    setSnap(snapshot(simRef.current));
+  }, [simulationRevision, simRef]);
+
+  useEffect(() => {
     if (!running) return;
     let last = performance.now();
     let frameId = 0;
@@ -125,6 +138,16 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
+  }, [running]);
+
+  useEffect(() => {
+    if (!running) return;
+    const watchdogTimer = window.setInterval(() => {
+      if (checkSimulationWatchdog(simRef.current)) {
+        setSnap(snapshot(simRef.current));
+      }
+    }, WATCHDOG_POLL_INTERVAL_MS);
+    return () => window.clearInterval(watchdogTimer);
   }, [running]);
 
   const phase: Phase = snap.finished
@@ -185,6 +208,14 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const injectAmbulance = () => {
     const lane = emergencyLane ?? "SOUTH";
     if (addVehicle(simRef.current, lane, true)) setSnap(snapshot(simRef.current));
+  };
+
+  const toggleSimulatedStaleData = () => {
+    setSimulationDataStale(
+      simRef.current,
+      !simRef.current.watchdog.simulatedStale
+    );
+    setSnap(snapshot(simRef.current));
   };
 
   const setLane = (lane: Direction, patch: Partial<Setup[Direction]>) =>
@@ -342,6 +373,40 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             Simulated prototype data · in-memory only · no official issuance or real payment
           </span>
         </div>
+        {snap.watchdog.failSafeActive && (
+          <div
+            role="alert"
+            className="rounded-lg border border-rose-500/50 bg-rose-500/10 p-3"
+          >
+            <div className="text-xs font-black tracking-wide text-rose-200">
+              FAIL-SAFE ACTIVE · NORMAL AND AMBULANCE GREEN DISPATCH BLOCKED
+            </div>
+            <p className="mt-1 text-[10px] text-slate-300">
+              {snap.watchdog.reason}{" "}
+              {snap.watchdog.recovering
+                ? snap.junctionClear
+                  ? "Valid updates resumed; verifying all-red timing and junction clearance."
+                  : "Valid updates resumed; waiting for the junction to clear before recovery."
+                : "Waiting for valid simulation updates. This is a software simulation, not a CCTV or hardware fault detector."}
+            </p>
+          </div>
+        )}
+        {snap.started && running && (
+          <button
+            type="button"
+            onClick={toggleSimulatedStaleData}
+            aria-pressed={snap.watchdog.simulatedStale}
+            className={`rounded-lg border px-3 py-2 text-[10px] font-bold ${
+              snap.watchdog.simulatedStale
+                ? "border-amber-400/40 bg-amber-400/10 text-amber-200"
+                : "border-slate-700 text-slate-400 hover:border-slate-500"
+            }`}
+          >
+            {snap.watchdog.simulatedStale
+              ? "RESTORE SIMULATED DATA UPDATES"
+              : "DEMO: SIMULATE STALE DATA"}
+          </button>
+        )}
 
         {dashboardTab === "SAFETY" ? (
           <div className="space-y-2 rounded-xl border border-rose-500/30 bg-slate-900/70 p-3">

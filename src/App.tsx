@@ -1,7 +1,9 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import TrafficOSSimulator from "./TrafficOSSimulator";
 import LiveTrafficConsole from "./components/LiveTrafficConsole";
 import QueueAnalytics from "./components/QueueAnalytics";
+import { createSim, defaultSetup } from "./simEngine";
+import type { Sim } from "./simEngine";
 
 type TabId = "landing" | "simulator" | "console" | "analytics" | "logs";
 
@@ -15,6 +17,12 @@ export default function App(): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<TabId>("landing");
   const [time, setTime] = useState<string>(new Date().toLocaleTimeString());
   const [cpuUsage, setCpuUsage] = useState<number>(14);
+  const [simulationRevision, setSimulationRevision] = useState(0);
+  const simulationRef = useRef<Sim>(createSim(defaultSetup(), "RR"));
+  const notifySimulationUpdate = useCallback(
+    () => setSimulationRevision((revision) => revision + 1),
+    []
+  );
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -101,15 +109,19 @@ export default function App(): React.JSX.Element {
 
       {/* 3. CONSTRAINED MAIN CONTENT CONTAINER */}
       <main className="flex-1 p-4 md:p-6 max-w-7xl w-full mx-auto">
-        {activeTab === "simulator" && (
-          <div className="rounded-3xl border border-slate-800/80 bg-[#0d1017]/80 backdrop-blur-xl p-3 sm:p-6 shadow-2xl">
-            <TrafficOSSimulator />
-          </div>
-        )}
+        <div className={activeTab === "simulator" ? "rounded-3xl border border-slate-800/80 bg-[#0d1017]/80 backdrop-blur-xl p-3 sm:p-6 shadow-2xl" : "hidden"}>
+          <TrafficOSSimulator
+            simulationRef={simulationRef}
+            simulationRevision={simulationRevision}
+          />
+        </div>
 
         {activeTab === "console" && (
           <div className="rounded-3xl border border-slate-800/80 bg-[#0d1017]/80 backdrop-blur-xl p-4 sm:p-6 shadow-2xl">
-            <LiveTrafficConsole />
+            <LiveTrafficConsole
+              simulationRef={simulationRef}
+              onSimulationUpdate={notifySimulationUpdate}
+            />
           </div>
         )}
 

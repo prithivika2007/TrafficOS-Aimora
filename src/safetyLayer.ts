@@ -12,6 +12,54 @@ export const STARVATION_LIMIT_SECONDS = 30;
 export const VIOLATION_EXTENSION_SECONDS = 3; // extra all-red after a red-light violation
 export const HOLD_EXTENSION_SECONDS = 2; // extra all-red while junction is not clear
 export const MAX_ALL_RED_EXTENSION_SECONDS = 10; // cap so the junction can never deadlock
+export const WATCHDOG_TIMEOUT_MS = 2000;
+export const WATCHDOG_POLL_INTERVAL_MS = 250;
+
+export interface WatchdogState {
+  lastValidUpdateMs: number;
+  simulatedStale: boolean;
+  failSafeActive: boolean;
+  recovering: boolean;
+  reason: string | null;
+}
+
+export const createWatchdogState = (now = Date.now()): WatchdogState => ({
+  lastValidUpdateMs: now,
+  simulatedStale: false,
+  failSafeActive: false,
+  recovering: false,
+  reason: null,
+});
+
+export function recordWatchdogUpdate(state: WatchdogState, now = Date.now()) {
+  if (state.simulatedStale) return;
+  state.lastValidUpdateMs = now;
+  if (state.failSafeActive) state.recovering = true;
+}
+
+export function setSimulatedStale(
+  state: WatchdogState,
+  stale: boolean,
+  now = Date.now()
+) {
+  state.simulatedStale = stale;
+  if (!stale) recordWatchdogUpdate(state, now);
+}
+
+export function checkWatchdog(state: WatchdogState, now = Date.now()): boolean {
+  if (
+    !state.failSafeActive &&
+    now - state.lastValidUpdateMs > WATCHDOG_TIMEOUT_MS
+  ) {
+    state.failSafeActive = true;
+    state.recovering = false;
+    state.reason = state.simulatedStale
+      ? "Simulated stale-update demonstration."
+      : "Simulation state updates exceeded the watchdog timeout.";
+    return true;
+  }
+  return false;
+}
 
 export interface SafetyState {
   phase: SignalPhase;
