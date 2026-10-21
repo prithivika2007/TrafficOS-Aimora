@@ -41,6 +41,12 @@ export interface LaneCalibration {
   crossingDirection: "POSITIVE" | "NEGATIVE";
 }
 
+export interface SignalSample {
+  red: boolean;
+  available: boolean;
+  observedAt: number;
+}
+
 export type LaneCalibrations = Record<
   "NORTH" | "EAST" | "SOUTH" | "WEST",
   LaneCalibration
@@ -50,7 +56,18 @@ export type VehicleDetector = Pick<ObjectDetection, "detect" | "dispose">;
 
 export async function loadVehicleDetector(): Promise<VehicleDetector> {
   // The model and weights are downloaded by the browser; frames stay on-device.
-  await import("@tensorflow/tfjs");
+  const tf = await import("@tensorflow/tfjs-core");
+  await import("@tensorflow/tfjs-backend-webgl");
+  await import("@tensorflow/tfjs-backend-cpu");
+  let backendReady = false;
+  try {
+    backendReady = await tf.setBackend("webgl");
+  } catch {
+    backendReady = false;
+  }
+  if (!backendReady) backendReady = await tf.setBackend("cpu");
+  if (!backendReady) throw new Error("No supported TensorFlow.js backend is available.");
+  await tf.ready();
   const cocoSsd = await import("@tensorflow-models/coco-ssd");
   return cocoSsd.load({ base: "lite_mobilenet_v2" });
 }
@@ -147,6 +164,19 @@ export function isInsideLane(
   );
 }
 
+function pointInsideLane(
+  x: number,
+  y: number,
+  calibration: LaneCalibration
+): boolean {
+  return (
+    x >= calibration.x &&
+    x <= calibration.x + calibration.width &&
+    y >= calibration.y &&
+    y <= calibration.y + calibration.height
+  );
+}
+
 export function crossedStopLine(
   track: DetectionBox,
   calibration: LaneCalibration
@@ -154,7 +184,8 @@ export function crossedStopLine(
   if (
     track.previousCenterX === null ||
     track.previousCenterY === null ||
-    !isInsideLane(track, calibration)
+    !isInsideLane(track, calibration) ||
+    !pointInsideLane(track.previousCenterX, track.previousCenterY, calibration)
   ) {
     return false;
   }
@@ -166,4 +197,20 @@ export function crossedStopLine(
   return calibration.crossingDirection === "POSITIVE"
     ? previous < calibration.stopLine && current >= calibration.stopLine
     : previous > calibration.stopLine && current <= calibration.stopLine;
+}
+
+/** A red crossing is confirmed only if consecutive samples bracket it on red. */
+export function canVerifyRedCrossing(
+  previous: SignalSample | undefined,
+  current: SignalSample,
+  maximumGapMs: number
+): boolean {
+  return Boolean(
+    previous &&
+      previous.available &&
+      previous.red &&
+      current.available &&
+      current.red &&
+      current.observedAt - previous.observedAt <= maximumGapMs
+  );
 }

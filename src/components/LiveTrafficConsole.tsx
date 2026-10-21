@@ -8,7 +8,9 @@ import {
 import type { Direction, Sim, ViolationLogEntry } from "../simEngine";
 import {
   DETECTION_INTERVAL_MS,
+  TRACK_EXPIRY_MS,
   VERIFIED_CONFIDENCE,
+  canVerifyRedCrossing,
   crossedStopLine,
   detectVehicles,
   isInsideLane,
@@ -19,6 +21,7 @@ import type {
   DetectionBox,
   LaneCalibration,
   LaneCalibrations,
+  SignalSample,
   VehicleDetector,
 } from "../vehicleDetection";
 
@@ -91,6 +94,7 @@ const VEHICLE_LABEL: Record<string, string> = {
   truck: "TRUCK",
   motorcycle: "MOTORCYCLE",
 };
+const MAX_SIGNAL_SAMPLE_GAP_MS = 750;
 
 export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
   simulationRef,
@@ -103,10 +107,12 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
   const tracksRef = useRef<DetectionBox[]>([]);
   const nextTrackIdRef = useRef(1);
   const crossedTracksRef = useRef(new Set<string>());
+  const signalObservationsRef = useRef(new Map<string, SignalSample>());
   const fileUrlRef = useRef<string | null>(null);
   const calibrationRef = useRef<LaneCalibrations>(INITIAL_CALIBRATION);
   const calibrationEnabledRef = useRef(false);
   const sourceRef = useRef<VideoSource>("DEMO VIDEO");
+  const videoSignalSynchronizedRef = useRef(false);
   const detectionEnabledRef = useRef(false);
   const mountedRef = useRef(false);
 
@@ -123,6 +129,7 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
   const [calibrations, setCalibrations] =
     useState<LaneCalibrations>(INITIAL_CALIBRATION);
   const [calibrationEnabled, setCalibrationEnabled] = useState(false);
+  const [videoSignalSynchronized, setVideoSignalSynchronized] = useState(false);
   const [events, setEvents] = useState<DetectionEvent[]>([]);
   const [violationLog, setViolationLog] = useState<ViolationLogEntry[]>([]);
   const [simulationTime, setSimulationTime] = useState(0);
@@ -130,6 +137,7 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
   calibrationRef.current = calibrations;
   calibrationEnabledRef.current = calibrationEnabled;
   sourceRef.current = source;
+  videoSignalSynchronizedRef.current = videoSignalSynchronized;
   detectionEnabledRef.current = detectionEnabled;
 
   const addEvent = useCallback((event: DetectionEvent) => {
@@ -147,11 +155,14 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
     setVideoFileUrl(null);
     setCameraError(null);
     setDetectionError(null);
+    setVideoSignalSynchronized(false);
+    videoSignalSynchronizedRef.current = false;
     setSource(nextSource);
     setIsPlaying(nextSource !== null);
     setTracks([]);
     tracksRef.current = [];
     crossedTracksRef.current.clear();
+    signalObservationsRef.current.clear();
     if (nextSource !== "LIVE CAMERA") {
       setDetectionEnabled(false);
       detectionEnabledRef.current = false;
@@ -193,18 +204,8 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
   };
 
   const disconnectCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) videoRef.current.srcObject = null;
-    setDetectionEnabled(false);
-    detectionEnabledRef.current = false;
-    setIsPlaying(false);
-    setSource(null);
-    setTracks([]);
-    tracksRef.current = [];
-    crossedTracksRef.current.clear();
+    selectSource(null);
+    setFps(0);
   };
 
   const selectVideoFile = (file: File | undefined) => {
@@ -267,6 +268,8 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
     detectionEnabledRef.current = false;
     setTracks([]);
     tracksRef.current = [];
+    crossedTracksRef.current.clear();
+    signalObservationsRef.current.clear();
     setFps(0);
   };
 
@@ -275,6 +278,7 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
     key: K,
     value: LaneCalibration[K]
   ) => {
+    signalObservationsRef.current.clear();
     setCalibrations((current) => {
       const next = { ...current[lane], [key]: value };
       next.x = Math.min(next.x, 1);
@@ -331,10 +335,11 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
         void detectVehicles(model, video)
           .then((rawDetections) => {
             if (cancelled) return;
+            const observedAt = performance.now();
             const updated = updateTracks(
               rawDetections,
               tracksRef.current,
-              performance.now(),
+              observedAt,
               nextTrackIdRef.current
             );
             tracksRef.current = updated.tracks;
@@ -342,18 +347,56 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
             setTracks(updated.tracks);
 
             if (calibrationEnabledRef.current) {
-              for (const lane of DIRECTIONS) {
-                const calibration = calibrationRef.current[lane];
-                for (const track of updated.tracks) {
-                  if (!crossedStopLine(track, calibration)) continue;
-                  const crossingKey = `${lane}:${track.id}`;
-                  if (crossedTracksRef.current.has(crossingKey)) continue;
-                  crossedTracksRef.current.add(crossingKey);
+              const sim = simulationRef.current;
+              const signalAvailable = sim.started && !sim.finished;
+              const currentSignal: Record<Direction, boolean> = {
+                NORTH: isLaneRed(sim, "NORTH"),
+                EAST: isLaneRed(sim, "EAST"),
+                SOUTH: isLaneRed(sim, "SOUTH"),
+                WEST: isLaneRed(sim, "WEST"),
+              };
+              const activeTrackIds = new Set(updated.tracks.map((track) => track.id));
+              for (const key of crossedTracksRef.current) {
+                const trackId = key.slice(key.indexOf(":") + 1);
+                if (!activeTrackIds.has(trackId)) crossedTracksRef.current.delete(key);
+              }
+              for (const [key, observation] of signalObservationsRef.current) {
+                if (observedAt - observation.observedAt > TRACK_EXPIRY_MS) {
+                  signalObservationsRef.current.delete(key);
+                }
+              }
 
-                  const eventId = `${crossingKey}:${Math.round(performance.now())}`;
-                  if (
+              for (const track of updated.tracks) {
+                if (track.lastSeenMs !== observedAt) continue;
+                const crossingLanes = DIRECTIONS.filter((lane) =>
+                  crossedStopLine(track, calibrationRef.current[lane])
+                );
+                const unhandledLanes = crossingLanes.filter((lane) => {
+                  const key = `${lane}:${track.id}`;
+                  if (crossedTracksRef.current.has(key)) return false;
+                  crossedTracksRef.current.add(key);
+                  return true;
+                });
+                if (unhandledLanes.length > 0) {
+                  const lane = unhandledLanes[0];
+                  const eventId = `${lane}:${track.id}:${Math.round(observedAt)}`;
+                  const previousSignal = signalObservationsRef.current.get(
+                    `${lane}:${track.id}`
+                  );
+                  if (crossingLanes.length > 1) {
+                    addEvent({
+                      id: eventId,
+                      at: Date.now(),
+                      lane,
+                      trackingId: track.id,
+                      status: "UNVERIFIED",
+                      detail: `Overlapping lane regions make this crossing ambiguous (${crossingLanes.join(", ")}).`,
+                    });
+                  } else if (
                     track.score < VERIFIED_CONFIDENCE ||
-                    sourceRef.current === "DEMO VIDEO"
+                    sourceRef.current === "DEMO VIDEO" ||
+                    (sourceRef.current === "VIDEO FILE" &&
+                      !videoSignalSynchronizedRef.current)
                   ) {
                     addEvent({
                       id: eventId,
@@ -364,40 +407,78 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
                       detail:
                         sourceRef.current === "DEMO VIDEO"
                           ? "Demo footage is not synchronized with the simulation signal."
+                          : sourceRef.current === "VIDEO FILE" &&
+                            !videoSignalSynchronizedRef.current
+                          ? "Video-file time is not synchronized with the active simulation signal."
                           : `Detection confidence ${Math.round(track.score * 100)}% is below the verification threshold.`,
                     });
-                    continue;
-                  }
-
-                  const sim = simulationRef.current;
-                  const result = recordCameraViolation(sim, lane, track.id);
-                  if (result === "RECORDED") {
+                  } else if (!currentSignal[lane]) {
                     addEvent({
                       id: eventId,
                       at: Date.now(),
                       lane,
                       trackingId: track.id,
-                      status: "VIOLATION",
-                      detail: "Crossed the calibrated stop line while the authoritative simulation signal was red.",
+                      status: "CLEARED",
+                      detail: "Crossing observed while the authoritative simulation signal was green.",
                     });
-                    setViolationLog(sim.violationLog.map((entry) => ({ ...entry })));
-                    onSimulationUpdate();
+                  } else if (
+                    !canVerifyRedCrossing(
+                      previousSignal,
+                      {
+                        red: currentSignal[lane],
+                        available: signalAvailable,
+                        observedAt,
+                      },
+                      MAX_SIGNAL_SAMPLE_GAP_MS
+                    )
+                  ) {
+                    addEvent({
+                      id: eventId,
+                      at: Date.now(),
+                      lane,
+                      trackingId: track.id,
+                      status: "UNVERIFIED",
+                      detail: "The signal was not continuously verified as red across consecutive detections; the crossing may have started before a phase change.",
+                    });
                   } else {
-                    addEvent({
-                      id: eventId,
-                      at: Date.now(),
-                      lane,
-                      trackingId: track.id,
-                      status: result === "SIGNAL_GREEN" ? "CLEARED" : "UNVERIFIED",
-                      detail:
-                        result === "SIGNAL_GREEN"
-                          ? "Crossing observed while the authoritative signal was green."
-                          : result === "SIGNAL_UNAVAILABLE"
-                          ? "No active simulation signal is available; no violation was recorded."
-                          : "Duplicate crossing already exists in the simulation violation log.",
-                    });
+                    const result = recordCameraViolation(sim, lane, track.id);
+                    if (result === "RECORDED") {
+                      addEvent({
+                        id: eventId,
+                        at: Date.now(),
+                        lane,
+                        trackingId: track.id,
+                        status: "VIOLATION",
+                        detail: "Crossed the calibrated stop line while the authoritative simulation signal remained red.",
+                      });
+                      setViolationLog(sim.violationLog.map((entry) => ({ ...entry })));
+                      onSimulationUpdate();
+                    } else {
+                      addEvent({
+                        id: eventId,
+                        at: Date.now(),
+                        lane,
+                        trackingId: track.id,
+                        status: result === "SIGNAL_GREEN" ? "CLEARED" : "UNVERIFIED",
+                        detail:
+                          result === "SIGNAL_GREEN"
+                            ? "Crossing observed while the authoritative signal was green."
+                            : result === "SIGNAL_UNAVAILABLE"
+                            ? "No active simulation signal is available; no violation was recorded."
+                            : "Duplicate crossing already exists in the simulation violation log.",
+                      });
+                    }
+                    setSimulationTime(sim.clock);
                   }
-                  setSimulationTime(sim.clock);
+                }
+
+                for (const lane of DIRECTIONS) {
+                  if (!isInsideLane(track, calibrationRef.current[lane])) continue;
+                  signalObservationsRef.current.set(`${lane}:${track.id}`, {
+                    red: currentSignal[lane],
+                    available: signalAvailable,
+                    observedAt,
+                  });
                 }
               }
             }
@@ -414,6 +495,10 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
             if (cancelled) return;
             setDetectionEnabled(false);
             detectionEnabledRef.current = false;
+            tracksRef.current = [];
+            setTracks([]);
+            crossedTracksRef.current.clear();
+            signalObservationsRef.current.clear();
             setDetectionStatus("ERROR");
             setDetectionError(
               `Vehicle detection failed: ${
@@ -678,6 +763,21 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
             </div>
           )}
 
+          {source === "VIDEO FILE" && (
+            <label className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-[10px] text-amber-200">
+              <input
+                type="checkbox"
+                checked={videoSignalSynchronized}
+                onChange={(event) => {
+                  signalObservationsRef.current.clear();
+                  crossedTracksRef.current.clear();
+                  setVideoSignalSynchronized(event.currentTarget.checked);
+                }}
+              />
+              I confirm this video file is synchronized with the active simulation signal (simulation demonstration only).
+            </label>
+          )}
+
           <div className="grid grid-cols-3 gap-2 text-center">
             <Metric label="DETECTIONS" value={String(tracks.filter((track) => performance.now() - track.lastSeenMs < 1000).length)} />
             <Metric label="INFERENCE FPS" value={String(fps)} />
@@ -730,7 +830,11 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
             <input
               type="checkbox"
               checked={calibrationEnabled}
-              onChange={(event) => setCalibrationEnabled(event.currentTarget.checked)}
+              onChange={(event) => {
+                signalObservationsRef.current.clear();
+                crossedTracksRef.current.clear();
+                setCalibrationEnabled(event.currentTarget.checked);
+              }}
             />
             I calibrated these regions and stop lines for this camera
           </label>
@@ -809,7 +913,7 @@ export const LiveTrafficConsole: React.FC<LiveTrafficConsoleProps> = ({
           ))}
         </div>
         <p className="text-[10px] text-amber-200/80">
-          Confirmed camera violations require active calibration, stable tracking, sufficient model confidence, and a red signal in the shared simulation. Demo video crossings are always UNVERIFIED because footage and simulation time are not synchronized.
+          Confirmed crossings require active calibration, stable tracking, sufficient model confidence, and consecutive red-signal samples from the shared simulation. Demo footage is always UNVERIFIED; video files stay UNVERIFIED unless the operator explicitly confirms signal-time synchronization.
         </p>
       </section>
 
