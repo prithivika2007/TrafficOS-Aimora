@@ -73,6 +73,7 @@ function DashboardShell(): React.JSX.Element {
     states,
     mode,
     running,
+    safetyTelemetry,
     start,
     pause,
     step,
@@ -148,6 +149,9 @@ function DashboardShell(): React.JSX.Element {
               <button onClick={step} disabled={running} aria-label="Step simulation">Step</button>
               <button onClick={reset} aria-label="Reset simulation"><span>↻</span></button>
             </div>
+            <span className={`guardian-header-badge ${safetyTelemetry.status === "CONFLICT" ? "conflict" : ""}`}>
+              <ShieldCheck size={13} /> SAFETY GUARDIAN · {safetyTelemetry.status === "ACTIVE" ? "ACTIVE / NO CONFLICTS" : "CONFLICT"}
+            </span>
             <span className={`sync-status ${running ? "is-running" : ""}`}><i /> {running ? "Kernel running" : "Kernel paused"}</span><span className="topbar-divider" /><span className="clock"><Clock3 size={14} />{time}</span><span className="topbar-divider" /><span className="cpu-status"><Gauge size={14} />{currentQueueCount} queued</span>
           </div>
         </header>

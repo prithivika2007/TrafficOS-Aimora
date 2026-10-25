@@ -21,7 +21,7 @@ const LOCATIONS: Record<JunctionId, [number, number]> = {
   D: [37.778, -122.397],
 };
 
-const COLORS = { teal: "#06b6d4", green: "#22c55e", amber: "#f59e0b", red: "#ef4444" };
+const COLORS = { teal: "#00f3ff", green: "#00f3ff", amber: "#ffe600", red: "#ff0055" };
 type HeatLayerWithFrame = L.HeatLayer & { _frame?: number | null };
 
 const colorForDensity = (density: number): string =>
@@ -63,8 +63,8 @@ export default function TrafficNetworkMap({
       <div className="map-view">
         <MapContainer center={[37.777, -122.409]} zoom={14} scrollWheelZoom className="leaflet-map">
           <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
           <TrafficHeatLayer state={network} />
           {ROAD_DEFINITIONS.filter((road) => road.from < road.to).map((road) => {
@@ -78,9 +78,9 @@ export default function TrafficNetworkMap({
                 positions={[LOCATIONS[road.from], LOCATIONS[road.to]]}
                 pathOptions={{
                   color: roadBlocked || spillback ? COLORS.red : COLORS.teal,
-                  weight: density > 0 ? 6 + Math.min(5, density * 5) : 5,
-                  opacity: 0.9,
-                  className: `neon-road ${roadBlocked || spillback ? "road-severe" : density > 0.75 ? "road-severe" : density > 0.4 ? "road-moderate" : ""}`,
+                  weight: density > 0 ? 6 + Math.min(3, density * 3) : 6,
+                  opacity: 1,
+                  className: `neon-road road-flow ${roadBlocked || spillback ? "road-severe" : density > 0.75 ? "road-severe" : density > 0.4 ? "road-moderate" : ""}`,
                 }}
               >
                 <Tooltip sticky>{`${road.from} ↔ ${road.to} · ${Math.round(density * 100)}% capacity${roadBlocked ? " · ROADBLOCK — DETOUR ACTIVE" : spillback ? " · SPILLBACK DETECTED" : ""}`}</Tooltip>
@@ -93,14 +93,19 @@ export default function TrafficNetworkMap({
               center={LOCATIONS[junction]}
               radius={selected === junction ? 12 : 9}
               pathOptions={{
-                color: "#a7f3d0",
-                fillColor: colorForDensity(incomingDensity(network, junction)),
+                color: network.signalSafety[junction].mode === "ALL_RED"
+                  ? COLORS.red
+                  : colorForDensity(incomingDensity(network, junction)),
+                fillColor: network.signalSafety[junction].mode === "ALL_RED"
+                  ? COLORS.red
+                  : colorForDensity(incomingDensity(network, junction)),
                 fillOpacity: 0.95,
-                weight: 3,
+                weight: 4,
+                className: `neon-node ${network.signalSafety[junction].mode === "ALL_RED" || incomingDensity(network, junction) > 0.75 ? "node-severe" : incomingDensity(network, junction) > 0.4 ? "node-moderate" : "node-clear"}`,
               }}
               eventHandlers={{ click: () => setSelected(junction) }}
             >
-              <Tooltip direction="top" offset={[0, -9]}>{`Junction ${junction} · ${JUNCTION_NAMES[junction]}`}</Tooltip>
+              <Tooltip direction="top" offset={[0, -9]}>{`Junction ${junction} · ${JUNCTION_NAMES[junction]}${network.signalSafety[junction].mode === "ALL_RED" ? ` · ALL-RED FAIL-SAFE (${(network.signalSafety[junction].clearanceTicks * 0.5).toFixed(1)}s)` : ""}`}</Tooltip>
             </CircleMarker>
           ))}
         </MapContainer>
@@ -116,7 +121,7 @@ export default function TrafficNetworkMap({
             </button>
             <p className="eyebrow">SIGNAL NODE · JUNCTION {selected}</p>
             <h3>{JUNCTION_NAMES[selected]}</h3>
-            <div className="junction-phase"><span className="signal-dot" /> SIGNAL PHASE {network.phases[selected] % 2 + 1} ACTIVE</div>
+            <div className="junction-phase"><span className="signal-dot" />{network.signalSafety[selected].mode === "ALL_RED" ? ` ALL-RED FAIL-SAFE · ${(network.signalSafety[selected].clearanceTicks * 0.5).toFixed(1)}s` : ` SIGNAL PHASE ${network.phases[selected] + 1} ACTIVE`}</div>
             <div className="junction-stats">
               <div><span>Incoming queues</span><strong>{incomingQueue(network, selected)} vehicles</strong></div>
               <div><span>Road capacity</span><strong>{ROAD_CAPACITY} vehicles / link</strong></div>

@@ -10,9 +10,12 @@ import {
 import {
   JUNCTIONS,
   ROAD_DEFINITIONS,
+  AMBER_CLEARANCE_SECONDS,
   createNetworkState,
+  inspectSignalSafety,
   networkMetrics,
   stepNetwork,
+  triggerSafetyFailSafe,
 } from "./networkEngine";
 import type { JunctionId, NetworkAlgorithm, NetworkMode, NetworkState } from "./networkEngine";
 import { createSim, defaultSetup } from "./simEngine";
@@ -37,9 +40,19 @@ export interface TelemetryPoint {
 export interface TrafficEvent {
   id: string;
   tick: number;
-  kind: "arrival" | "served" | "phase" | "spillback" | "roadblock";
+  kind: "arrival" | "served" | "phase" | "spillback" | "roadblock" | "safety";
   message: string;
   junction: JunctionId;
+}
+
+export interface SafetyTelemetry {
+  status: "ACTIVE" | "CONFLICT";
+  mutexStatus: string;
+  clearanceSeconds: number;
+  violationAuditCount: number;
+  inspectionCount: number;
+  inspectedAt: number;
+  logs: string[];
 }
 
 interface TrafficContextValue {
@@ -56,6 +69,8 @@ interface TrafficContextValue {
   step: () => void;
   reset: () => void;
   setRoadBlock: (roadId: string, blocked: boolean) => void;
+  safetyTelemetry: SafetyTelemetry;
+  testConflictIntercept: () => void;
   singleIntersection: MutableRefObject<Sim>;
   simulationRevision: number;
   notifySimulationUpdate: () => void;
@@ -80,6 +95,16 @@ const initialPoint = (): TelemetryPoint => ({
   independentTravel: 0,
   coordinatedTravel: 0,
   contextSwitches: 0,
+});
+
+const initialSafetyTelemetry = (): SafetyTelemetry => ({
+  status: "ACTIVE",
+  mutexStatus: "LOCKED · ONE APPROACH",
+  clearanceSeconds: 0,
+  violationAuditCount: 0,
+  inspectionCount: 0,
+  inspectedAt: Date.now(),
+  logs: [],
 });
 
 function eventsFor(previous: NetworkState, next: NetworkState): TrafficEvent[] {
@@ -135,6 +160,7 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
   const statesRef = useRef(states);
   const [history, setHistory] = useState<TelemetryPoint[]>([initialPoint()]);
   const [events, setEvents] = useState<TrafficEvent[]>([]);
+  const [safetyTelemetry, setSafetyTelemetry] = useState(initialSafetyTelemetry);
   const [running, setRunning] = useState(false);
   const [mode, setMode] = useState<NetworkMode>("coordinated");
   const [algorithm, setAlgorithm] = useState<NetworkAlgorithm>("ROUND_ROBIN");
@@ -190,6 +216,36 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     return () => window.clearInterval(timer);
   }, [running, step]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const activeState = statesRef.current[mode];
+      const inspection = inspectSignalSafety(activeState);
+      const clearanceSeconds = Math.max(
+        ...JUNCTIONS.map((junction) => activeState.signalSafety[junction].clearanceTicks * 0.5)
+      );
+      const allRedJunctions = JUNCTIONS.filter(
+        (junction) => activeState.signalSafety[junction].mode === "ALL_RED"
+      ).length;
+      setSafetyTelemetry((current) => ({
+        status: inspection.clear ? "ACTIVE" : "CONFLICT",
+        mutexStatus: allRedJunctions
+          ? `FAIL-SAFE · ${allRedJunctions} ALL-RED`
+          : "LOCKED · ONE APPROACH",
+        clearanceSeconds,
+        violationAuditCount: JUNCTIONS.reduce(
+          (count, junction) => count + activeState.signalSafety[junction].violationAuditCount,
+          0
+        ),
+        inspectionCount: current.inspectionCount + 1,
+        inspectedAt: Date.now(),
+        logs: inspection.clear
+          ? inspection.logs
+          : [...inspection.conflicts, ...inspection.logs],
+      }));
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [mode]);
+
   const start = useCallback(() => setRunning(true), []);
   const pause = useCallback(() => setRunning(false), []);
   const reset = useCallback(() => {
@@ -199,10 +255,30 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     setStates(initial);
     setHistory([initialPoint()]);
     setEvents([]);
+    setSafetyTelemetry(initialSafetyTelemetry());
     eventCounter.current = 0;
     singleIntersection.current = createSim(defaultSetup(), "RR");
     setSimulationRevision((revision) => revision + 1);
   }, []);
+  const testConflictIntercept = useCallback(() => {
+    const junction: JunctionId = "A";
+    const previous = statesRef.current;
+    const next = {
+      independent: triggerSafetyFailSafe(previous.independent, junction),
+      coordinated: triggerSafetyFailSafe(previous.coordinated, junction),
+    };
+    statesRef.current = next;
+    setStates(next);
+    const event: TrafficEvent = {
+      id: `safety-test-${eventCounter.current++}`,
+      tick: previous[mode].tick,
+      kind: "safety",
+      message: `Junction ${junction}: conflicting green request intercepted; ALL-RED fail-safe engaged for ${AMBER_CLEARANCE_SECONDS.toFixed(1)}s`,
+      junction,
+    };
+    setEvents((current) => [event, ...current].slice(0, 30));
+  }, [mode]);
+
   const setRoadBlock = useCallback((roadId: string, blocked: boolean) => {
     const road = ROAD_DEFINITIONS.find((item) => item.id === roadId);
     if (!road) throw new Error(`Unknown road link: ${roadId}`);
@@ -246,11 +322,13 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
       step,
       reset,
       setRoadBlock,
+      safetyTelemetry,
+      testConflictIntercept,
       singleIntersection,
       simulationRevision,
       notifySimulationUpdate,
     }),
-    [states, history, events, running, mode, algorithm, start, pause, step, reset, setRoadBlock, simulationRevision, notifySimulationUpdate]
+    [states, history, events, running, mode, algorithm, start, pause, step, reset, setRoadBlock, safetyTelemetry, testConflictIntercept, simulationRevision, notifySimulationUpdate]
   );
   return <TrafficContext.Provider value={value}>{children}</TrafficContext.Provider>;
 }

@@ -31,6 +31,13 @@ export interface SignalSafetyInspection {
   logs: string[];
 }
 
+export interface SignalSafetyState {
+  mode: "GREEN" | "ALL_RED";
+  pendingPhase: number | null;
+  clearanceTicks: number;
+  violationAuditCount: number;
+}
+
 export type NetworkAlgorithm = "ROUND_ROBIN" | "PRIORITY_AGING";
 
 export interface NetworkState {
@@ -43,6 +50,7 @@ export interface NetworkState {
   laneWaitTicks: Record<string, number>;
   blockedRoads: Record<string, boolean>;
   roadBlocks: Record<string, boolean>;
+  signalSafety: Record<JunctionId, SignalSafetyState>;
   spillbackEvents: { tick: number; roadId: string }[];
   served: number;
   waitSeconds: number;
@@ -62,6 +70,8 @@ export const JUNCTION_NAMES: Record<JunctionId, string> = {
   D: "Market & 5th",
 };
 const COORDINATION_CAPACITY_THRESHOLD = 0.75;
+export const AMBER_CLEARANCE_SECONDS = 2;
+const AMBER_CLEARANCE_TICKS = AMBER_CLEARANCE_SECONDS / 0.5;
 export const ROAD_DEFINITIONS: NetworkRoad[] = [
   { id: "AB", from: "A", to: "B", capacity: ROAD_CAPACITY },
   { id: "BA", from: "B", to: "A", capacity: ROAD_CAPACITY },
@@ -106,6 +116,12 @@ export const createNetworkState = (): NetworkState => ({
   laneWaitTicks: Object.fromEntries(ROAD_DEFINITIONS.map((road) => [road.id, 0])),
   blockedRoads: Object.fromEntries(ROAD_DEFINITIONS.map((road) => [road.id, false])),
   roadBlocks: Object.fromEntries(ROAD_DEFINITIONS.map((road) => [road.id, false])),
+  signalSafety: Object.fromEntries(
+    JUNCTIONS.map((junction) => [
+      junction,
+      { mode: "GREEN", pendingPhase: null, clearanceTicks: 0, violationAuditCount: 0 },
+    ])
+  ) as Record<JunctionId, SignalSafetyState>,
   spillbackEvents: [],
   served: 0,
   waitSeconds: 0,
@@ -147,6 +163,9 @@ export const stepNetwork = (
     laneWaitTicks: { ...state.laneWaitTicks },
     blockedRoads: { ...state.blockedRoads },
     roadBlocks: { ...state.roadBlocks },
+    signalSafety: Object.fromEntries(
+      JUNCTIONS.map((junction) => [junction, { ...state.signalSafety[junction] }])
+    ) as Record<JunctionId, SignalSafetyState>,
     spillbackEvents: [...state.spillbackEvents],
   };
   const seconds = next.tick * 0.5;
@@ -231,6 +250,17 @@ export const stepNetwork = (
 
   JUNCTIONS.forEach((junction) => {
     const incoming = ROAD_DEFINITIONS.filter((road) => road.to === junction);
+    const safety = next.signalSafety[junction];
+    if (safety.mode === "ALL_RED") {
+      safety.clearanceTicks = Math.max(0, safety.clearanceTicks - 1);
+      if (safety.clearanceTicks === 0 && safety.pendingPhase !== null) {
+        next.phases[junction] = safety.pendingPhase;
+        safety.pendingPhase = null;
+        safety.mode = "GREEN";
+      }
+      return;
+    }
+    const previousPhase = next.phases[junction];
     const phase = next.phases[junction];
     const hasVehicle = (road: NetworkRoad): boolean =>
       Boolean(next.roads[road.id][0] && next.roads[road.id][0].id === eligibleHeads[road.id]);
@@ -291,6 +321,15 @@ export const stepNetwork = (
         );
         next.phaseTicks[junction] = 0;
       }
+    }
+
+    const selectedPhase = next.phases[junction] % incoming.length;
+    if (signalAxis(incoming[previousPhase % incoming.length]) !== signalAxis(incoming[selectedPhase])) {
+      safety.mode = "ALL_RED";
+      safety.pendingPhase = selectedPhase;
+      safety.clearanceTicks = AMBER_CLEARANCE_TICKS;
+      next.phases[junction] = previousPhase;
+      return;
     }
 
     const greenRoad = incoming[next.phases[junction] % incoming.length];
@@ -431,15 +470,42 @@ export function inspectSignalSafety(state: NetworkState): SignalSafetyInspection
   const logs = JUNCTIONS.map((junction) => {
     const approaches = ROAD_DEFINITIONS.filter((road) => road.to === junction);
     const phase = state.phases[junction];
+    const safety = state.signalSafety[junction];
     if (!Number.isInteger(phase) || phase < 0 || phase >= approaches.length) {
       conflicts.push(`Junction ${junction} has an invalid signal phase (${phase}).`);
       return `Junction ${junction}: invalid phase ${phase}; inspection failed.`;
     }
-    const active = approaches.filter((_, index) => index === phase);
-    if (active.length > 1) {
-      conflicts.push(`Junction ${junction} has conflicting green approaches.`);
+    if (safety.mode === "ALL_RED") {
+      return `Junction ${junction}: ALL-RED fail-safe; ${safety.clearanceTicks * 0.5}s clearance remaining.`;
     }
-    return `Junction ${junction}: ${active.length} green approach active; 0 conflicting greens.`;
+    return `Junction ${junction}: ${signalAxis(approaches[phase])} green; opposing approaches held red.`;
   });
   return { clear: conflicts.length === 0, conflicts, logs };
+}
+
+export function triggerSafetyFailSafe(
+  state: NetworkState,
+  junction: JunctionId
+): NetworkState {
+  const next = {
+    ...state,
+    phases: { ...state.phases },
+    phaseTicks: { ...state.phaseTicks },
+    signalSafety: Object.fromEntries(
+      JUNCTIONS.map((node) => [node, { ...state.signalSafety[node] }])
+    ) as Record<JunctionId, SignalSafetyState>,
+  };
+  next.signalSafety[junction] = {
+    mode: "ALL_RED",
+    pendingPhase: state.phases[junction],
+    clearanceTicks: AMBER_CLEARANCE_TICKS,
+    violationAuditCount: state.signalSafety[junction].violationAuditCount + 1,
+  };
+  return next;
+}
+
+function signalAxis(road: NetworkRoad): "NORTH-SOUTH" | "EAST-WEST" {
+  return road.id === "AB" || road.id === "BA" || road.id === "CD" || road.id === "DC"
+    ? "EAST-WEST"
+    : "NORTH-SOUTH";
 }
