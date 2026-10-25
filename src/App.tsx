@@ -181,16 +181,20 @@ function DashboardShell(): React.JSX.Element {
             <span className="breadcrumbs" style={{ fontSize: "14px" }}>{breadcrumbGroup} / <b style={{ color: "#38bdf8" }}>{activePage === "overview" ? "Overview" : PAGE_TITLES[activePage]}</b></span>
           </div>
           <div className="topbar-right" style={{ gap: "16px" }}>
-            <div className="global-controls">
-              <button style={{ padding: "8px 16px", fontSize: "13px", fontWeight: 700 }} className="global-control-primary" onClick={running ? pause : start} aria-label={running ? "Pause simulation" : "Start simulation"}>{running ? "Ⅱ" : "▶"}<span>{running ? "Pause" : "Start"}</span></button>
-              <button style={{ padding: "8px 12px", fontSize: "13px", fontWeight: 700 }} onClick={step} disabled={running} aria-label="Step simulation">Step</button>
-              <button style={{ padding: "8px 10px", fontSize: "13px" }} onClick={reset} aria-label="Reset simulation"><span>↻</span></button>
-            </div>
-            <span style={{ fontSize: "12px", padding: "6px 12px", fontWeight: 700 }} className={`guardian-header-badge ${safetyTelemetry.status === "CONFLICT" ? "conflict" : ""}`}>
-              <ShieldCheck size={15} /> SAFETY GUARDIAN · {safetyTelemetry.status === "ACTIVE" ? "ACTIVE / NO CONFLICTS" : "SAFETY VIOLATION DETECTED — FAILSAFE ENGAGED"}
-            </span>
-            <span style={{ fontSize: "13px", fontWeight: 600 }} className={`sync-status ${running ? "is-running" : ""}`}><i /> {running ? "Kernel running" : "Kernel paused"}</span>
-            <span className="topbar-divider" />
+            {activePage === "overview" && (
+              <>
+                <div className="global-controls">
+                  <button style={{ padding: "8px 16px", fontSize: "13px", fontWeight: 700 }} className="global-control-primary" onClick={running ? pause : start} aria-label={running ? "Pause simulation" : "Start simulation"}>{running ? "Ⅱ" : "▶"}<span>{running ? "Pause" : "Start"}</span></button>
+                  <button style={{ padding: "8px 12px", fontSize: "13px", fontWeight: 700 }} onClick={step} disabled={running} aria-label="Step simulation">Step</button>
+                  <button style={{ padding: "8px 10px", fontSize: "13px" }} onClick={reset} aria-label="Reset simulation"><span>↻</span></button>
+                </div>
+                <span style={{ fontSize: "12px", padding: "6px 12px", fontWeight: 700 }} className={`guardian-header-badge ${safetyTelemetry.status === "CONFLICT" ? "conflict" : ""}`}>
+                  <ShieldCheck size={15} /> SAFETY GUARDIAN · {safetyTelemetry.status === "ACTIVE" ? "ACTIVE / NO CONFLICTS" : "SAFETY VIOLATION DETECTED — FAILSAFE ENGAGED"}
+                </span>
+                <span style={{ fontSize: "13px", fontWeight: 600 }} className={`sync-status ${running ? "is-running" : ""}`}><i /> {running ? "Kernel running" : "Kernel paused"}</span>
+                <span className="topbar-divider" />
+              </>
+            )}
             <span className="clock" style={{ fontSize: "14px", fontWeight: 700 }}><Clock3 size={16} />{time}</span>
             <span className="topbar-divider" />
             <span className="cpu-status" style={{ fontSize: "13px", fontWeight: 700 }}><Gauge size={16} />{currentQueueCount} queued</span>
@@ -225,7 +229,7 @@ function DashboardShell(): React.JSX.Element {
           {activePage === "incidents" && <TrafficIncidents />}
           {activePage === "analytics" && <TrafficAnalytics />}
           {activePage === "learn" && <LearnPage navigate={navigate} />}
-          {activePage === "console" && <div className="legacy-console panel"><div className="page-heading"><div><p className="eyebrow">CONNECTED SYSTEMS</p><h1>Live traffic console</h1><p>Camera feed, synthetic detection, and vehicle queue controls.</p></div></div><LiveTrafficConsole simulationRef={simulationRef} onSimulationUpdate={notifySimulationUpdate} /></div>}
+          {activePage === "console" && <div className="legacy-console panel"><div className="page-heading"><div><p className="eyebrow">CONNECTED SYSTEMS</p><h1>Live traffic console</h1><p>Demo, uploaded, and live camera video with on-device vehicle detection overlays.</p></div></div><LiveTrafficConsole simulationRef={simulationRef} /></div>}
           </React.Suspense>
           </motion.div>
           </AnimatePresence>
