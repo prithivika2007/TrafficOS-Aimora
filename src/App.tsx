@@ -196,21 +196,31 @@ function DashboardShell(): React.JSX.Element {
             <span className="cpu-status" style={{ fontSize: "13px", fontWeight: 700 }}><Gauge size={16} />{currentQueueCount} queued</span>
           </div>
         </header>
-        <main className="main-content">
+        <main className={activePage === "scheduler" ? "main-content scheduler-page" : "main-content"}>
           <AnimatePresence mode="wait">
           <motion.div key={activePage} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: 0.18 }}>
-          {activePage !== "overview" && <div className="page-back-row"><button className="back-overview-button" onClick={() => navigate("overview")}>← Back to Overview</button></div>}
+          {activePage !== "overview" && activePage !== "scheduler" && <div className="page-back-row"><button className="back-overview-button" onClick={() => navigate("overview")}>← Back to Overview</button></div>}
           <React.Suspense fallback={<div className="panel route-loading">Loading simulation view…</div>}>
           {activePage === "overview" && <Overview navigate={navigate} startMapScenario={startMapScenario} />}
           {activePage === "map" && <TrafficNetworkMap onOpenLab={() => navigate("network")} scenario={mapScenario} />}
           {(activePage === "scheduler" || activePage === "emergency") && (
-            <div className="legacy-lab-wrap">
-              <div className="page-heading"><div><p className="eyebrow">{activePage === "emergency" ? "EMERGENCY RESPONSE · ISR PREEMPTION" : "SINGLE INTERSECTION · ALGORITHM EVALUATION"}</p><h1>{PAGE_TITLES[activePage]}</h1><p className={activePage === "scheduler" ? "text-sm font-medium text-slate-300" : ""}>{activePage === "emergency" ? "Test ambulance detection, safe signal preemption, and scheduler recovery." : "Evaluate Round Robin, static timers, and priority aging at a single junction."}</p></div></div>
-              {activePage === "emergency" && <EmergencyRouteVisual />}
-              <TrafficOSSimulator simulationRef={simulationRef} simulationRevision={simulationRevision} />
-              <div className="sim-disclaimer">SIMULATION MODEL — SYNTHETIC TRAFFIC DATA FOR ALGORITHMIC BENCHMARKING</div>
-            </div>
-          )}
+  <div className={`legacy-lab-wrap ${activePage === "scheduler" ? "scheduler-lab-wrap" : ""}`}>
+    <div className="page-heading">
+      <div>
+        <p className="eyebrow">{activePage === "emergency" ? "EMERGENCY RESPONSE · ISR PREEMPTION" : "SINGLE INTERSECTION · ALGORITHM EVALUATION"}</p>
+        <h1>{PAGE_TITLES[activePage]}</h1>
+        <p className={activePage === "scheduler" ? "text-sm font-medium text-slate-300" : ""}>
+          {activePage === "emergency"
+            ? "Test ambulance detection, safe signal preemption, and scheduler recovery."
+            : "Evaluate Round Robin, static timers, and priority aging at a single junction."}
+        </p>
+      </div>
+    </div>
+    {activePage === "emergency" && <EmergencyRouteVisual />}
+    <TrafficOSSimulator simulationRef={simulationRef} simulationRevision={simulationRevision} />
+    <div className="sim-disclaimer">SIMULATION MODEL — SYNTHETIC TRAFFIC DATA FOR ALGORITHMIC BENCHMARKING</div>
+  </div>
+)}
           {activePage === "network" && <TrafficNetworkLab />}
           {activePage === "incidents" && <TrafficIncidents />}
           {activePage === "analytics" && <TrafficAnalytics />}

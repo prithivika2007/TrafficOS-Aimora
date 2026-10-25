@@ -7,6 +7,7 @@ import {
   DIRECTIONS,
   MAX_PER_LANE,
   AGING_STEP,
+  ADAPTIVE_PRIORITY_BOOST_LEVELS,
   Setup,
   Sim,
   Snapshot,
@@ -24,6 +25,7 @@ import {
   triggerRoadIncident,
 } from "./simEngine";
 import type { IncidentType } from "./simEngine";
+import type { SchedulerAdaptation } from "./simEngine";
 import type { EChallan } from "./eChallan";
 import {
   STARVATION_LIMIT_SECONDS,
@@ -78,10 +80,37 @@ type BenchmarkAlgo = "STATIC" | "RR" | "PRIORITY_AGING";
 type ScenarioMode = "NORMAL" | "HEATMAP" | "ACCIDENT";
 type HeatLevel = "FREE" | "MODERATE" | "HEAVY";
 type IncidentDuration = "30" | "60" | "120" | "UNTIL_CLEARED";
+const ADAPTIVE_MIN_GREEN_SECONDS = 5;
+const ADAPTIVE_MAX_GREEN_SECONDS = 12;
+const ADAPTIVE_CONGESTION_FACTOR = 0.07;
+const ADAPTIVE_HIGH_THRESHOLD = 70;
+const ADAPTIVE_LOW_THRESHOLD = 40;
+const ADAPTIVE_HYSTERESIS_SECONDS = 10;
+const ADAPTIVE_SWITCH_COOLDOWN_SECONDS = 10;
+const ADAPTATION_METRICS_WINDOW_SECONDS = 30;
+
 interface HeatLane {
   score: number;
   samples: number[];
 }
+
+interface AdaptationSwitchState {
+  switched: boolean;
+  previousAlgo: Algo | null;
+  highSince: Record<Direction, number | null>;
+  lowSince: number | null;
+  lastSwitchAt: number;
+  boostedLane: Direction | null;
+}
+
+const createAdaptationSwitchState = (): AdaptationSwitchState => ({
+  switched: false,
+  previousAlgo: null,
+  highSince: { NORTH: null, EAST: null, SOUTH: null, WEST: null },
+  lowSince: null,
+  lastSwitchAt: -Infinity,
+  boostedLane: null,
+});
 
 const heatLevel = (score: number): HeatLevel =>
   score < 40 ? "FREE" : score < 70 ? "MODERATE" : "HEAVY";
@@ -658,6 +687,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [aging, setAging] = useState<boolean>(true);
   const [speed, setSpeed] = useState<number>(1);
   const [scenarioMode, setScenarioMode] = useState<ScenarioMode>("NORMAL");
+  const [autoAdaptOn, setAutoAdaptOn] = useState(true);
+  const [adaptationReason, setAdaptationReason] = useState("Monitoring congestion; no automatic switch yet.");
   const [incidentLane, setIncidentLane] = useState<Direction>("NORTH");
   const [incidentType, setIncidentType] = useState<IncidentType>("ACCIDENT");
   const [incidentDuration, setIncidentDuration] = useState<IncidentDuration>("30");
@@ -669,7 +700,10 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [dashboardTab, setDashboardTab] = useState<DashboardTab>("SAFETY");
   const [selectedChallan, setSelectedChallan] = useState<EChallan | null>(null);
   const [ambulanceScenario, setAmbulanceScenario] = useState<AmbulanceScenario>("IDLE");
+  const [manualAlgoOverride, setManualAlgoOverride] = useState(false);
   const repeatedArrivalLaneRef = useRef(0);
+  const adaptationSwitchRef = useRef<AdaptationSwitchState>(createAdaptationSwitchState());
+  const manualAlgoOverrideRef = useRef(false);
 
   const localSimRef = useRef<Sim>(createSim(setup, selectedAlgo, emergencyLane));
   const simRef = simulationRef ?? localSimRef;
@@ -717,8 +751,53 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     });
   };
 
-  const cfgRef = useRef({ algo: selectedAlgo, quantum: timeQuantum, aging, speed });
-  cfgRef.current = { algo: selectedAlgo, quantum: timeQuantum, aging, speed };
+  const adaptationEnabled = scenarioMode === "HEATMAP" && autoAdaptOn;
+  const adaptiveQuantums = DIRECTIONS.reduce<Record<Direction, number>>(
+    (quantums, lane) => {
+      quantums[lane] = Number(
+        Math.min(
+          ADAPTIVE_MAX_GREEN_SECONDS,
+          Math.max(
+            ADAPTIVE_MIN_GREEN_SECONDS,
+            ADAPTIVE_MIN_GREEN_SECONDS +
+              heatmap[lane].score * ADAPTIVE_CONGESTION_FACTOR
+          )
+        ).toFixed(1)
+      );
+      return quantums;
+    },
+    { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 }
+  );
+  const schedulerAdaptation: SchedulerAdaptation | undefined = scenarioMode === "HEATMAP"
+    ? {
+        enabled: autoAdaptOn,
+        trackComparison: true,
+        laneQuantums: adaptiveQuantums,
+        congestionScores: DIRECTIONS.reduce<Record<Direction, number>>(
+          (scores, lane) => {
+            scores[lane] = heatmap[lane].score;
+            return scores;
+          },
+          { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 }
+        ),
+        priorityBoost: adaptationSwitchRef.current.boostedLane,
+      }
+    : undefined;
+
+  const cfgRef = useRef({
+    algo: selectedAlgo,
+    quantum: timeQuantum,
+    aging,
+    speed,
+    adaptation: schedulerAdaptation,
+  });
+  cfgRef.current = {
+    algo: selectedAlgo,
+    quantum: timeQuantum,
+    aging,
+    speed,
+    adaptation: schedulerAdaptation,
+  };
 
   useEffect(() => {
     if (!autoScrollEvents || !eventScrollRef.current) return;
@@ -783,6 +862,87 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   }, []);
 
   useEffect(() => {
+    const state = adaptationSwitchRef.current;
+    const now = snap.clock;
+    if (!adaptationEnabled || manualAlgoOverrideRef.current) {
+      state.highSince = { NORTH: null, EAST: null, SOUTH: null, WEST: null };
+      state.lowSince = null;
+      return;
+    }
+
+    DIRECTIONS.forEach((lane) => {
+      state.highSince[lane] =
+        heatmap[lane].score > ADAPTIVE_HIGH_THRESHOLD
+          ? state.highSince[lane] ?? now
+          : null;
+    });
+    const highLane = DIRECTIONS
+      .filter((lane) => state.highSince[lane] !== null)
+      .sort((a, b) => heatmap[b].score - heatmap[a].score)
+      .find(
+        (lane) =>
+          now - (state.highSince[lane] ?? now) >= ADAPTIVE_HYSTERESIS_SECONDS
+      );
+
+    if (
+      !state.switched &&
+      highLane &&
+      now - state.lastSwitchAt >= ADAPTIVE_SWITCH_COOLDOWN_SECONDS
+    ) {
+      const previousAlgo = selectedAlgo;
+      const score = Math.round(heatmap[highLane].score);
+      state.previousAlgo = previousAlgo;
+      state.switched = true;
+      state.boostedLane = highLane;
+      state.lowSince = null;
+      state.lastSwitchAt = now;
+      const reason =
+        previousAlgo === "PRIORITY_AGING"
+          ? `Priority + Aging retained; ${highLane} was at ${score}% for 10s, so its priority was boosted.`
+          : `Switched ${previousAlgo} to Priority + Aging because ${highLane} was at ${score}% for 10s.`;
+      setAdaptationReason(reason);
+      setSelectedAlgo("PRIORITY_AGING");
+      setEventSimTime(simRef.current.clock);
+      addEvent({
+        type: "SCHEDULER",
+        severity: "warn",
+        lane: highLane,
+        message: `Adaptation switched ${previousAlgo} to Priority + Aging because ${highLane} was at ${score}% for 10s`,
+      });
+      return;
+    }
+
+    if (state.switched && highLane && state.boostedLane !== highLane) {
+      state.boostedLane = highLane;
+    }
+    const allLanesLow = DIRECTIONS.every(
+      (lane) => heatmap[lane].score < ADAPTIVE_LOW_THRESHOLD
+    );
+    state.lowSince = allLanesLow ? state.lowSince ?? now : null;
+    if (
+      state.switched &&
+      state.lowSince !== null &&
+      now - state.lowSince >= ADAPTIVE_HYSTERESIS_SECONDS &&
+      now - state.lastSwitchAt >= ADAPTIVE_SWITCH_COOLDOWN_SECONDS
+    ) {
+      const previousAlgo = state.previousAlgo ?? "RR";
+      const reason = `Switched back to ${previousAlgo} because all lanes stayed below 40% for 10s.`;
+      state.switched = false;
+      state.boostedLane = null;
+      state.lowSince = null;
+      state.lastSwitchAt = now;
+      setAdaptationReason(reason);
+      setSelectedAlgo(previousAlgo);
+      setEventSimTime(simRef.current.clock);
+      addEvent({
+        type: "SCHEDULER",
+        severity: "info",
+        message: `Adaptation switched Priority + Aging back to ${previousAlgo} because all lanes stayed below 40% for 10s`,
+      });
+    }
+  }, [adaptationEnabled, heatmap, selectedAlgo, simRef, snap.clock]);
+
+  useEffect(() => {
     if (isAlgo(initialAlgoConfig?.algo)) {
       const nextAlgo = initialAlgoConfig.algo;
       if (nextAlgo !== selectedAlgo) {
@@ -819,7 +979,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
       const c = cfgRef.current;
       const dt = Math.min((now - last) / 1000, 0.1) * c.speed;
       last = now;
-      step(simRef.current, dt, c.algo, c.quantum, c.aging);
+      step(simRef.current, dt, c.algo, c.quantum, c.aging, c.adaptation);
       advanceBenchmarks(dt, c.quantum, c.algo);
       setSnap(snapshot(simRef.current));
       const benchmarksComplete = [...new Set<BenchmarkAlgo>(["STATIC", c.algo])].every(
@@ -971,16 +1131,34 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     DIRECTIONS.reduce((n, d) => n + setup[d].count, 0) +
     (selectedAlgo === "PRIORITY_AGING" && emergencyLane ? 1 : 0);
 
+  const resetAdaptationForNewRun = (): Algo => {
+    const switchState = adaptationSwitchRef.current;
+    const nextAlgo =
+      switchState.switched &&
+      !manualAlgoOverrideRef.current &&
+      switchState.previousAlgo
+        ? switchState.previousAlgo
+        : selectedAlgo;
+    adaptationSwitchRef.current = {
+      ...createAdaptationSwitchState(),
+      previousAlgo: nextAlgo,
+    };
+    setSelectedAlgo(nextAlgo);
+    setAdaptationReason("Monitoring congestion; no automatic switch yet.");
+    return nextAlgo;
+  };
+
   const reset = () => {
     setRunning(false);
     setAmbulanceScenario("IDLE");
     clearFrozenBenchmark();
     setSelectedChallan(null);
-    const nextSetup = presetSetup(selectedAlgo);
+    const algo = resetAdaptationForNewRun();
+    const nextSetup = presetSetup(algo);
     setEmergencyLane(null);
     setSetup(nextSetup);
-    simRef.current = createSim(nextSetup, selectedAlgo);
-    benchmarkSimsRef.current = createBenchmarkSims(nextSetup, selectedAlgo, null);
+    simRef.current = createSim(nextSetup, algo);
+    benchmarkSimsRef.current = createBenchmarkSims(nextSetup, algo, null);
     setSnap(snapshot(simRef.current));
   };
 
@@ -991,12 +1169,13 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     } else if (phase === "COMPLETED" || phase === "STOPPED") {
       clearFrozenBenchmark();
       setSelectedChallan(null);
+      const algo = resetAdaptationForNewRun();
       simRef.current = createSim(
         setup,
-        selectedAlgo,
-        selectedAlgo === "PRIORITY_AGING" ? emergencyLane : null
+        algo,
+        algo === "PRIORITY_AGING" ? emergencyLane : null
       );
-      benchmarkSimsRef.current = createBenchmarkSims(setup, selectedAlgo, emergencyLane);
+      benchmarkSimsRef.current = createBenchmarkSims(setup, algo, emergencyLane);
       setSnap(snapshot(simRef.current));
       setRunning(true);
     } else if (totalVehicles > 0 || simRef.current.cars.length > 0) {
@@ -1016,7 +1195,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     if (phase === "COMPLETED" || phase === "STOPPED") return;
     clearFrozenBenchmark();
     const c = cfgRef.current;
-    step(simRef.current, 1, c.algo, c.quantum, c.aging);
+    step(simRef.current, 1, c.algo, c.quantum, c.aging, c.adaptation);
     advanceBenchmarks(1, c.quantum, c.algo);
     setSnap(snapshot(simRef.current));
   };
@@ -1090,7 +1269,68 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const setLane = (lane: Direction, patch: Partial<Setup[Direction]>) =>
     setSetup((prev) => ({ ...prev, [lane]: { ...prev[lane], ...patch } }));
 
+  const recordAdaptationEvent = (message: string, severity: "info" | "warn" = "info") => {
+    setEventSimTime(simRef.current.clock);
+    addEvent({ type: "SCHEDULER", severity, message });
+  };
+
+  const handleScenarioModeChange = (nextMode: ScenarioMode) => {
+    const switchState = adaptationSwitchRef.current;
+    if (scenarioMode === "HEATMAP" && nextMode !== "HEATMAP" && switchState.switched) {
+      if (!manualAlgoOverrideRef.current && switchState.previousAlgo) {
+        setSelectedAlgo(switchState.previousAlgo);
+      }
+      switchState.switched = false;
+      switchState.boostedLane = null;
+      switchState.lowSince = null;
+      switchState.highSince = { NORTH: null, EAST: null, SOUTH: null, WEST: null };
+    }
+    setScenarioMode(nextMode);
+  };
+
+  const toggleAutoAdapt = () => {
+    const enabled = !autoAdaptOn;
+    const switchState = adaptationSwitchRef.current;
+    if (!enabled) {
+      if (switchState.switched && !manualAlgoOverrideRef.current && switchState.previousAlgo) {
+        setSelectedAlgo(switchState.previousAlgo);
+      }
+      switchState.switched = false;
+      switchState.boostedLane = null;
+      switchState.lowSince = null;
+      switchState.highSince = { NORTH: null, EAST: null, SOUTH: null, WEST: null };
+    } else {
+      manualAlgoOverrideRef.current = false;
+      setManualAlgoOverride(false);
+      adaptationSwitchRef.current = {
+        ...createAdaptationSwitchState(),
+        previousAlgo: selectedAlgo,
+      };
+    }
+    setAutoAdaptOn(enabled);
+    setAdaptationReason(
+      enabled
+        ? "Monitoring congestion; automatic switching is enabled."
+        : "Auto-Adapt is off; the scheduler uses its selected algorithm and fixed quantum."
+    );
+    recordAdaptationEvent(`Adaptation turned ${enabled ? "ON" : "OFF"}`);
+  };
+
   const handleAlgoChange = (algo: Algo) => {
+    const manualOverride = scenarioMode === "HEATMAP" && autoAdaptOn;
+    manualAlgoOverrideRef.current = manualOverride;
+    setManualAlgoOverride(manualOverride);
+    adaptationSwitchRef.current = {
+      ...createAdaptationSwitchState(),
+      previousAlgo: algo,
+      lastSwitchAt: simRef.current.clock,
+    };
+    if (manualOverride) {
+      setAdaptationReason(
+        `Manual ${algo} selection overrides automatic switching until Auto-Adapt is re-enabled.`
+      );
+      recordAdaptationEvent(`Adaptation automatic switching paused by manual ${algo} selection`);
+    }
     setEventSimTime(simRef.current.clock);
     addEvent({
       type: "SCHEDULER",
@@ -1259,6 +1499,49 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     snap.incident?.expiresAt === null || snap.incident?.expiresAt === undefined
       ? null
       : Math.max(0, snap.incident.expiresAt - snap.clock);
+  const adaptationWindowStart = Math.max(
+    0,
+    snap.clock - ADAPTATION_METRICS_WINDOW_SECONDS
+  );
+  const currentAdaptationSamples = simRef.current.adaptationSamples.filter(
+    (sample) => sample.time >= adaptationWindowStart
+  );
+  const currentAdaptationExposure = simRef.current.adaptationExposure.filter(
+    (sample) => sample.time >= adaptationWindowStart
+  );
+  const adaptationWindow = (enabled: boolean) => {
+    const laneSamples = currentAdaptationSamples.filter(
+      (sample) => sample.enabled === enabled
+    );
+    const exposure = currentAdaptationExposure
+      .filter((sample) => sample.enabled === enabled)
+      .reduce((total, sample) => total + sample.seconds, 0);
+    if (exposure < 10 || laneSamples.length < 3) return null;
+    return {
+      avgWait:
+        laneSamples.reduce((total, sample) => total + sample.wait, 0) /
+        laneSamples.length,
+      maxWait: Math.max(...laneSamples.map((sample) => sample.wait)),
+      throughput: (laneSamples.length / exposure) * 60,
+    };
+  };
+  const adaptationOffMetrics = adaptationWindow(false);
+  const adaptationOnMetrics = adaptationWindow(true);
+  const adaptationImpact =
+    adaptationOffMetrics && adaptationOnMetrics
+      ? {
+          avgWait: adaptationOffMetrics.avgWait > 0
+            ? ((adaptationOnMetrics.avgWait - adaptationOffMetrics.avgWait) /
+                adaptationOffMetrics.avgWait) *
+              100
+            : null,
+          throughput: adaptationOffMetrics.throughput > 0
+            ? ((adaptationOnMetrics.throughput - adaptationOffMetrics.throughput) /
+                adaptationOffMetrics.throughput) *
+              100
+            : null,
+        }
+      : null;
   const locked = snap.started;
   const pendingFineTotal = snap.challans
     .filter((challan) => challan.paymentStatus === "Pending")
@@ -1954,7 +2237,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             <select
               id="scenario-mode"
               value={scenarioMode}
-              onChange={(event) => setScenarioMode(event.target.value as ScenarioMode)}
+              onChange={(event) => handleScenarioModeChange(event.target.value as ScenarioMode)}
               className={selectCls}
             >
               <option value="NORMAL">Normal Traffic</option>
@@ -2004,6 +2287,132 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                     </tbody>
                   </table>
                 </div>
+                <section className="space-y-3 rounded-xl border border-cyan-500/20 bg-slate-950/60 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-xs font-bold text-cyan-200">Adaptation</h3>
+                      <p className="mt-1 text-[9px] text-slate-400">
+                        {ALGO_LABEL[selectedAlgo]} · {adaptationReason}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      aria-pressed={autoAdaptOn}
+                      onClick={toggleAutoAdapt}
+                      className={`rounded-lg border px-3 py-2 text-[9px] font-black ${
+                        autoAdaptOn
+                          ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200"
+                          : "border-slate-700 bg-slate-900 text-slate-400"
+                      }`}
+                    >
+                      AUTO-ADAPT {autoAdaptOn ? "ON" : "OFF"}
+                      {manualAlgoOverride ? " · MANUAL OVERRIDE" : ""}
+                    </button>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[440px] text-left text-[9px]">
+                      <thead className="text-slate-500">
+                        <tr>
+                          {["Lane", "Congestion %", "Quantum (before → after)", "Priority"].map((label) => (
+                            <th key={label} className="px-2 py-1.5 font-bold">{label}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {DIRECTIONS.map((lane) => {
+                          const boosted = adaptationEnabled &&
+                            adaptationSwitchRef.current.boostedLane === lane;
+                          const after = adaptationEnabled
+                            ? adaptiveQuantums[lane]
+                            : timeQuantum;
+                          return (
+                            <tr key={lane} className="border-t border-slate-800 text-slate-300">
+                              <td className="px-2 py-2 font-bold">{lane}</td>
+                              <td className="px-2 py-2">{Math.round(heatmap[lane].score)}%</td>
+                              <td className="px-2 py-2">{timeQuantum}s → {after.toFixed(1)}s</td>
+                              <td className="px-2 py-2">
+                                {boosted
+                                  ? `P${Math.max(0, setup[lane].priority - ADAPTIVE_PRIORITY_BOOST_LEVELS)} · boosted`
+                                  : `P${setup[lane].priority}`}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div>
+                    <h4 className="mb-1.5 text-[9px] font-bold uppercase tracking-wide text-slate-400">
+                      Recent adaptation decisions
+                    </h4>
+                    <div className="space-y-1">
+                      {events
+                        .filter(
+                          (event) =>
+                            event.type === "SCHEDULER" &&
+                            event.message.startsWith("Adaptation")
+                        )
+                        .slice(-5)
+                        .reverse()
+                        .map((event) => (
+                          <div key={event.id} className="grid grid-cols-[auto_1fr] gap-2 text-[9px] text-slate-300">
+                            <span className="font-mono text-slate-500">{event.simTime}</span>
+                            <span>{event.message}</span>
+                          </div>
+                        ))}
+                      {!events.some(
+                        (event) =>
+                          event.type === "SCHEDULER" &&
+                          event.message.startsWith("Adaptation")
+                      ) && (
+                        <p className="text-[9px] text-slate-500">No adaptation decisions yet.</p>
+                      )}
+                    </div>
+                  </div>
+                  <div className="space-y-2 border-t border-slate-800 pt-2">
+                    <h4 className="text-[9px] font-bold uppercase tracking-wide text-slate-400">
+                      Adaptation impact · rolling 30s
+                    </h4>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {[
+                        { label: "AVG WAIT CHANGE", value: adaptationImpact?.avgWait },
+                        { label: "THROUGHPUT CHANGE", value: adaptationImpact?.throughput },
+                      ].map((metric) => (
+                        <div key={metric.label} className="rounded-lg border border-slate-800 bg-slate-900/70 p-2">
+                          <span className="block text-[8px] font-bold text-slate-500">{metric.label}</span>
+                          <span className={`text-xs font-black ${
+                            metric.value === null || metric.value === undefined
+                              ? "text-slate-400"
+                              : metric.label.startsWith("AVG")
+                              ? metric.value <= 0 ? "text-emerald-300" : "text-rose-300"
+                              : metric.value >= 0 ? "text-emerald-300" : "text-rose-300"
+                          }`}>
+                            {metric.value === null || metric.value === undefined
+                              ? "collecting data..."
+                              : `${metric.value > 0 ? "+" : ""}${metric.value.toFixed(1)}%`}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {[
+                        { label: "ADAPTATION OFF", value: adaptationOffMetrics },
+                        { label: "ADAPTATION ON", value: adaptationOnMetrics },
+                      ].map((metric) => (
+                        <div key={metric.label} className="rounded-lg border border-slate-800 bg-slate-900/70 p-2">
+                          <span className="mb-1 block text-[8px] font-bold text-slate-400">{metric.label}</span>
+                          {metric.value ? (
+                            <span className="text-[8px] text-slate-300">
+                              Avg {metric.value.avgWait.toFixed(1)}s · Max {metric.value.maxWait.toFixed(1)}s · {metric.value.throughput.toFixed(1)} veh/min
+                            </span>
+                          ) : (
+                            <span className="text-[8px] text-slate-500">collecting data...</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
               </div>
             )}
             {scenarioMode === "ACCIDENT" && (

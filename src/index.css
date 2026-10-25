@@ -443,13 +443,7 @@ body {
 .ticker-event { display: inline-flex; align-items: center; gap: 6px; overflow: hidden; color: #a5b1c0; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .ticker-event i { flex: 0 0 5px; width: 5px; height: 5px; border-radius: 50%; background: #14b8a6; }.ticker-event i.phase { background: #06b6d4; }.ticker-event i.spillback { background: #ef4444; box-shadow: 0 0 8px #ef4444; }.ticker-event i.served { background: #22c55e; }
 .ticker-state { color: #708095; font-size: 7px; font-weight: 800; letter-spacing: .6px; }
-.scheduler-visual,.emergency-route-panel { padding: 15px; margin-bottom: 14px; }
-.scheduler-canvas { position: relative; height: 290px; margin-top: 12px; overflow: hidden; border: 1px solid #223344; border-radius: 9px; background: #1E293B; }
-.scheduler-canvas svg { width: 100%; height: 100%; }.scheduler-overlay { position: absolute; right: 12px; bottom: 12px; display: flex; align-items: center; gap: 7px; padding: 8px 10px; color: #6de1a1; border: 1px solid #235c48; border-radius: 7px; background: #08130ee8; font-size: 8px; font-weight: 800; }
-.scheduler-overlay small { margin-left: 4px; color: #9aa8b7; font-size: 7px; font-weight: 500; }
-.svg-signal-flow { stroke-dasharray: 8 7; animation: signal-flow 1s linear infinite; }
-@keyframes signal-flow { to { stroke-dashoffset: -30; } }
-.pulse-badge { animation: pulse-subtle 1.6s ease-in-out infinite; }
+.emergency-route-panel { padding: 15px; margin-bottom: 14px; }
 .emergency-route-panel { border-color: #72313c; box-shadow: inset 0 0 35px #ef44440a; }
 .emergency-route { position: relative; height: 95px; margin: 16px 8px 8px; }
 .route-path { position: absolute; top: 32px; right: 9%; left: 10%; height: 3px; background: linear-gradient(90deg,#ef4444,#fecaca,#ef4444); box-shadow: 0 0 12px #ef4444; }
@@ -523,7 +517,6 @@ body {
   .safety-meters { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .global-controls { gap: 1px; }.global-controls button { padding: 0 6px; }.global-controls button:nth-child(2) { font-size: 0; }
   .topbar-right { gap: 7px; }.event-ticker { gap: 8px; }.ticker-state { display: none; }
-  .scheduler-canvas { height: 230px; }.scheduler-overlay small { display: none; }
   .starvation-monitor { flex-wrap: wrap; }.starvation-monitor > b { width: 100%; }
   .analytics-charts { grid-template-columns: 1fr; }.analytics-chart:nth-child(3) { grid-column: auto; }
 }
@@ -561,17 +554,8 @@ body {
 .corridor-location-badge strong { color: #67e8f9; font-size: 14px; font-weight: 700; letter-spacing: .05em; line-height: 1.5; }
 .corridor-location-badge span { color: #cbd5e1; font-size: 12px; font-weight: 500; }
 .back-overview-button { cursor: pointer; }
-.scheduler-traffic-canvas { display: block; width: 100%; height: 100%; }
-.approach-status-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; margin-top: 10px; }
-.approach-status { display: grid; grid-template-columns: 8px 1fr auto; align-items: center; gap: 5px 8px; padding: 9px 10px; border: 1px solid #334155; border-radius: 8px; background: #0d1520; color: #e2e8f0; }
-.approach-status i { grid-row: span 2; width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
-.approach-status b { font-size: 12px; font-weight: 800; }
-.approach-status span { grid-column: 2; color: #cbd5e1; font-size: 11px; }
-.approach-status strong { grid-column: 3; grid-row: 1 / span 2; font-size: 10px; }
-.approach-north { color: #EC4899; }.approach-east { color: #3B82F6; }.approach-south { color: #8B5CF6; }.approach-west { color: #F59E0B; }
-.scheduler-overlay { font-size: 12px; }
-.scheduler-overlay small { color: #cbd5e1; font-size: 11px; }
-.approach-status strong { font-size: 11px; }
+.main-content.scheduler-page { padding-top: 0; }
+.scheduler-lab-wrap > .font-executive { padding-top: 0; }
 .page-back-row { display: flex; justify-content: flex-start; margin: 0 0 18px; }
 .back-overview-button { padding: 9px 13px; color: #e2e8f0; border: 1px solid #425064; border-radius: 8px; background: #111a27; font-size: 13px; font-weight: 700; cursor: pointer; transition: .18s ease; }
 .back-overview-button:hover { color: #67e8f9; border-color: #22d3ee; background: #10212b; }
@@ -591,7 +575,6 @@ body {
 @media (max-width: 760px) {
   .corridor-location-badge strong { font-size: 12px; }
   .map-scenario-status { right: 8px; left: 8px; text-align: center; font-size: 10px; }
-  .approach-status-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
 
 .topbar {
