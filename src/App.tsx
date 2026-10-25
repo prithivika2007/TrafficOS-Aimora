@@ -278,8 +278,9 @@ function EventTicker(): React.JSX.Element {
 }
 
 function SchedulerVisual(): React.JSX.Element {
-  const { states, mode, running } = useTraffic();
+  const { states, mode, running, events } = useTraffic();
   const state = states[mode];
+  const emergencySpawnId = events.find((event) => event.kind === "preemption")?.id ?? null;
   const approachCounts = [
     state.demand.A.length,
     state.demand.B.length,
@@ -289,7 +290,7 @@ function SchedulerVisual(): React.JSX.Element {
   return <section className="panel scheduler-visual">
     <div className="panel-heading"><div><p className="eyebrow">SINGLE JUNCTION · LIVE SIGNAL STATE</p><h2>Intersection control surface</h2></div><span className={`simulation-badge ${running ? "pulse-badge" : ""}`}>{mode.toUpperCase()} · T+{(state.tick * 0.5).toFixed(1)}s</span></div>
     <div className="scheduler-canvas">
-      <SchedulerTrafficCanvas phase={state.phases.A} phaseTicks={state.phaseTicks.A} allRed={state.signalSafety.A.mode === "ALL_RED"} approachCounts={approachCounts} />
+      <SchedulerTrafficCanvas phase={state.phases.A} phaseTicks={state.phaseTicks.A} allRed={state.signalSafety.A.mode === "ALL_RED"} approachCounts={approachCounts} emergencySpawnId={emergencySpawnId} />
       <div className="scheduler-overlay"><span className="signal-dot" />{state.signalSafety.A.mode === "ALL_RED" ? "ALL-RED FAIL-SAFE" : `${(["NORTH", "EAST", "SOUTH", "WEST"] as const)[state.phases.A % 4]} APPROACH GREEN`}<small>{JUNCTIONS.reduce((sum, node) => sum + state.demand[node].length, 0)} queued vehicles · shared simulation</small></div>
     </div>
     <div className="approach-status-grid">
@@ -312,30 +313,34 @@ interface CanvasVehicle {
   width: number;
   length: number;
   color: string;
-  kind: "car" | "ambulance";
+  kind: "sedan" | "suv" | "truck" | "ambulance";
   flashing: number;
 }
 
 const APPROACH_COLORS = ["#EC4899", "#3B82F6", "#8B5CF6", "#F59E0B"];
 const VEHICLE_TYPES = [
-  { width: 14, length: 24, color: "#dbeafe", kind: "car" as const },
-  { width: 16, length: 28, color: "#a5b4fc", kind: "car" as const },
-  { width: 18, length: 42, color: "#cbd5e1", kind: "car" as const },
-  { width: 16, length: 30, color: "#f8fafc", kind: "ambulance" as const },
+  { width: 14, length: 24, kind: "sedan" as const },
+  { width: 16, length: 28, kind: "suv" as const },
+  { width: 18, length: 40, kind: "truck" as const },
 ];
+const MIN_VEHICLE_GAP = 14;
 
 function SchedulerTrafficCanvas({
   phase,
   phaseTicks,
   allRed,
   approachCounts,
+  emergencySpawnId,
 }: {
   phase: number;
   phaseTicks: number;
   allRed: boolean;
   approachCounts: number[];
+  emergencySpawnId: string | null;
 }): React.JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const vehiclesRef = useRef<CanvasVehicle[][]>([]);
+  const handledEmergency = useRef<string | null>(null);
   const liveRef = useRef({ phase, phaseTicks, allRed, approachCounts });
   useEffect(() => {
     liveRef.current = { phase, phaseTicks, allRed, approachCounts };
@@ -350,14 +355,17 @@ function SchedulerTrafficCanvas({
         const type = VEHICLE_TYPES[(index + lane) % VEHICLE_TYPES.length];
         return {
           ...type,
-          progress: 62 - index * 48,
+          color: APPROACH_COLORS[lane],
+          progress: 0,
           speed: 0,
           flashing: Math.random() * Math.PI * 2,
         } satisfies CanvasVehicle;
       })
     );
+    vehiclesRef.current = vehicles;
     let animationFrame = 0;
     let lastFrame = 0;
+    let initialized = false;
 
     const draw = (timestamp: number) => {
       const deltaSeconds = lastFrame ? Math.min((timestamp - lastFrame) / 1000, 0.05) : 1 / 60;
@@ -377,40 +385,53 @@ function SchedulerTrafficCanvas({
       const live = liveRef.current;
       const centerX = width / 2;
       const centerY = height / 2;
+      const roadWidth = Math.min(112, Math.min(width, height) * 0.36);
       const centerDistance = Math.min(width, height) * 0.5;
-      const stopProgress = Math.max(76, centerDistance - 38);
+      if (!initialized) {
+        vehicles.forEach((laneVehicles) => {
+          const front = laneVehicles[0];
+          let progress = Math.max(42, centerDistance - roadWidth / 2 - 10 - front.length / 2);
+          laneVehicles.forEach((vehicle, index) => {
+            if (index > 0) {
+              const ahead = laneVehicles[index - 1];
+              progress -= (ahead.length + vehicle.length) / 2 + MIN_VEHICLE_GAP;
+            }
+            vehicle.progress = progress;
+          });
+        });
+        initialized = true;
+      }
+      const stopLineDistance = centerDistance - roadWidth / 2 - 10;
       const greenPhase = live.phase % 4;
       const amber = live.phaseTicks % 6 >= 4;
       const directions = [
         { name: "NORTH", x: centerX - 22, y: 0, angle: Math.PI, color: APPROACH_COLORS[0] },
-        { name: "EAST", x: width, y: centerY - 22, angle: Math.PI / 2, color: APPROACH_COLORS[1] },
+        { name: "EAST", x: width, y: centerY - 22, angle: -Math.PI / 2, color: APPROACH_COLORS[1] },
         { name: "SOUTH", x: centerX + 22, y: height, angle: 0, color: APPROACH_COLORS[2] },
-        { name: "WEST", x: 0, y: centerY + 22, angle: -Math.PI / 2, color: APPROACH_COLORS[3] },
+        { name: "WEST", x: 0, y: centerY + 22, angle: Math.PI / 2, color: APPROACH_COLORS[3] },
       ];
       directions.forEach((direction, lane) => {
         const isGreen = !live.allRed && greenPhase === lane && !amber;
         const light = live.allRed ? "#ef4444" : greenPhase === lane ? (amber ? "#f59e0b" : "#22c55e") : "#ef4444";
         drawSignal(context, direction.x, direction.y, direction.angle, light);
-        drawApproachStripe(context, direction, centerX, centerY, width, height);
+        drawApproachStripe(context, direction, centerX, centerY, width, height, roadWidth);
 
         const laneVehicles = vehicles[lane];
         laneVehicles.sort((a, b) => b.progress - a.progress);
         laneVehicles.forEach((vehicle, index) => {
           const ahead = laneVehicles[index - 1];
           const vehicleProgressLimit = ahead
-            ? ahead.progress - (ahead.length + vehicle.length) / 2 - 10
-            : isGreen ? Math.max(width, height) + vehicle.length : stopProgress;
+            ? ahead.progress - (ahead.length + vehicle.length) / 2 - MIN_VEHICLE_GAP
+            : isGreen ? Math.max(width, height) + vehicle.length : stopLineDistance - vehicle.length / 2;
           const distanceToLimit = Math.max(0, vehicleProgressLimit - vehicle.progress);
           const targetSpeed = Math.min(72, Math.sqrt(distanceToLimit * 2 * 100));
           const acceleration = targetSpeed > vehicle.speed ? 115 : 210;
           vehicle.speed += Math.sign(targetSpeed - vehicle.speed) * acceleration * deltaSeconds;
           vehicle.speed = Math.max(0, Math.min(targetSpeed, vehicle.speed));
-          vehicle.progress = Math.min(
-            vehicle.progress + vehicle.speed * deltaSeconds,
-            Math.max(vehicle.progress, vehicleProgressLimit)
-          );
+          vehicle.progress = Math.min(vehicle.progress + vehicle.speed * deltaSeconds, vehicleProgressLimit);
           if (vehicle.progress >= Math.max(width, height) + vehicle.length) {
-            vehicle.progress = 0;
+            const tail = laneVehicles[laneVehicles.length - 1];
+            vehicle.progress = tail.progress - (tail.length + vehicle.length) / 2 - MIN_VEHICLE_GAP;
             vehicle.speed = 0;
           }
           const position = vehiclePosition(direction.name, vehicle.progress, centerX, centerY, width, height);
@@ -424,28 +445,158 @@ function SchedulerTrafficCanvas({
     return () => window.cancelAnimationFrame(animationFrame);
   }, []);
 
+  useEffect(() => {
+    if (!emergencySpawnId) {
+      handledEmergency.current = null;
+      return;
+    }
+    if (handledEmergency.current === emergencySpawnId) return;
+    const laneVehicles = vehiclesRef.current[3];
+    if (!laneVehicles) return;
+    handledEmergency.current = emergencySpawnId;
+    const ambulance: CanvasVehicle = {
+      progress: Math.min(...laneVehicles.map((vehicle) =>
+        vehicle.progress - (vehicle.length + 40) / 2 - MIN_VEHICLE_GAP
+      )),
+      speed: 0,
+      width: 18,
+      length: 40,
+      color: "#f8fafc",
+      kind: "ambulance",
+      flashing: Math.random() * Math.PI * 2,
+    };
+    laneVehicles.push(ambulance);
+  }, [emergencySpawnId]);
+
   return <canvas ref={canvasRef} className="scheduler-traffic-canvas" role="img" aria-label="Continuously animated four-way traffic intersection with directional vehicle queues" />;
 }
 
 function drawSchedulerRoad(context: CanvasRenderingContext2D, width: number, height: number): void {
   const cx = width / 2;
   const cy = height / 2;
-  const roadWidth = Math.min(128, Math.min(width, height) * 0.42);
-  context.fillStyle = "#101b29";
+  const roadWidth = Math.min(112, Math.min(width, height) * 0.36);
+  const halfRoad = roadWidth / 2;
+  context.fillStyle = "#1E293B";
+  context.fillRect(0, 0, width, height);
+  context.fillStyle = "#ffffff08";
+  for (let index = 0; index < 180; index += 1) {
+    const x = (index * 83 + 19) % Math.max(1, width);
+    const y = (index * 47 + 31) % Math.max(1, height);
+    context.fillRect(x, y, index % 3 === 0 ? 2 : 1, 1);
+  }
+  context.fillStyle = "#0F172A";
   context.fillRect(0, cy - roadWidth / 2, width, roadWidth);
   context.fillRect(cx - roadWidth / 2, 0, roadWidth, height);
-  context.strokeStyle = "#3d5063";
+  context.fillStyle = "#111c2b";
+  context.fillRect(cx - halfRoad, cy - halfRoad, roadWidth, roadWidth);
+  context.strokeStyle = "#ffffff";
   context.lineWidth = 2;
-  context.setLineDash([12, 10]);
+  context.setLineDash([14, 12]);
+  context.globalAlpha = 0.78;
   context.beginPath();
   context.moveTo(0, cy);
+  context.lineTo(cx - halfRoad, cy);
+  context.moveTo(cx + halfRoad, cy);
   context.lineTo(width, cy);
   context.moveTo(cx, 0);
+  context.lineTo(cx, cy - halfRoad);
+  context.moveTo(cx, cy + halfRoad);
   context.lineTo(cx, height);
   context.stroke();
   context.setLineDash([]);
-  context.fillStyle = "#263748";
-  context.fillRect(cx - roadWidth / 2, cy - roadWidth / 2, roadWidth, roadWidth);
+  context.globalAlpha = 1;
+
+  context.strokeStyle = "#64748b";
+  context.lineWidth = 2;
+  context.beginPath();
+  context.moveTo(0, cy - halfRoad);
+  context.lineTo(width, cy - halfRoad);
+  context.moveTo(0, cy + halfRoad);
+  context.lineTo(width, cy + halfRoad);
+  context.moveTo(cx - halfRoad, 0);
+  context.lineTo(cx - halfRoad, height);
+  context.moveTo(cx + halfRoad, 0);
+  context.lineTo(cx + halfRoad, height);
+  context.stroke();
+
+  drawCrosswalk(context, cx - halfRoad - 27, cy, roadWidth, "vertical");
+  drawCrosswalk(context, cx + halfRoad + 27, cy, roadWidth, "vertical");
+  drawCrosswalk(context, cx, cy - halfRoad - 27, roadWidth, "horizontal");
+  drawCrosswalk(context, cx, cy + halfRoad + 27, roadWidth, "horizontal");
+  drawStopLine(context, cx - halfRoad - 7, cy + 24, "vertical", 18);
+  drawStopLine(context, cx + halfRoad + 7, cy - 24, "vertical", 18);
+  drawStopLine(context, cx - 24, cy - halfRoad - 7, "horizontal", 18);
+  drawStopLine(context, cx + 24, cy + halfRoad + 7, "horizontal", 18);
+  drawTurningGuides(context, cx, cy, halfRoad);
+}
+
+function drawCrosswalk(
+  context: CanvasRenderingContext2D,
+  centerX: number,
+  centerY: number,
+  roadWidth: number,
+  orientation: "horizontal" | "vertical"
+): void {
+  const count = 7;
+  const stripeWidth = 5;
+  const stripeGap = 5;
+  const stripeLength = roadWidth * 0.64;
+  context.fillStyle = "#f8fafc";
+  context.globalAlpha = 0.88;
+  for (let index = 0; index < count; index += 1) {
+    if (orientation === "vertical") {
+      const y = centerY - ((count * stripeWidth + (count - 1) * stripeGap) / 2) + index * (stripeWidth + stripeGap);
+      context.fillRect(centerX - stripeLength / 2, y, stripeLength, stripeWidth);
+    } else {
+      const x = centerX - ((count * stripeWidth + (count - 1) * stripeGap) / 2) + index * (stripeWidth + stripeGap);
+      context.fillRect(x, centerY - stripeLength / 2, stripeWidth, stripeLength);
+    }
+  }
+  context.globalAlpha = 1;
+}
+
+function drawStopLine(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  orientation: "horizontal" | "vertical",
+  halfLength: number
+): void {
+  context.strokeStyle = "#f8fafc";
+  context.lineWidth = 4;
+  context.beginPath();
+  if (orientation === "vertical") {
+    context.moveTo(x, y - halfLength);
+    context.lineTo(x, y + halfLength);
+  } else {
+    context.moveTo(x - halfLength, y);
+    context.lineTo(x + halfLength, y);
+  }
+  context.stroke();
+}
+
+function drawTurningGuides(
+  context: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  halfRoad: number
+): void {
+  context.save();
+  context.strokeStyle = "#cbd5e166";
+  context.lineWidth = 2;
+  context.setLineDash([7, 7]);
+  const offset = halfRoad * 0.62;
+  context.beginPath();
+  context.moveTo(cx - offset, cy - halfRoad);
+  context.bezierCurveTo(cx - offset, cy - offset, cx - halfRoad, cy - offset, cx - halfRoad, cy - offset);
+  context.moveTo(cx + offset, cy - halfRoad);
+  context.bezierCurveTo(cx + offset, cy - offset, cx + halfRoad, cy - offset, cx + halfRoad, cy - offset);
+  context.moveTo(cx - offset, cy + halfRoad);
+  context.bezierCurveTo(cx - offset, cy + offset, cx - halfRoad, cy + offset, cx - halfRoad, cy + offset);
+  context.moveTo(cx + offset, cy + halfRoad);
+  context.bezierCurveTo(cx + offset, cy + offset, cx + halfRoad, cy + offset, cx + halfRoad, cy + offset);
+  context.stroke();
+  context.restore();
 }
 
 function drawApproachStripe(
@@ -454,40 +605,30 @@ function drawApproachStripe(
   cx: number,
   cy: number,
   width: number,
-  height: number
+  height: number,
+  roadWidth: number
 ): void {
   context.strokeStyle = direction.color;
-  context.globalAlpha = 0.8;
-  context.lineWidth = 3;
+  context.globalAlpha = 0.45;
+  context.lineWidth = 2;
+  context.setLineDash([8, 9]);
   context.beginPath();
   if (direction.name === "WEST") {
     context.moveTo(0, cy + 24);
-    context.lineTo(cx - 54, cy + 24);
+    context.lineTo(cx - roadWidth / 2 - 31, cy + 24);
   } else if (direction.name === "EAST") {
     context.moveTo(width, cy - 24);
-    context.lineTo(cx + 54, cy - 24);
+    context.lineTo(cx + roadWidth / 2 + 31, cy - 24);
   } else if (direction.name === "NORTH") {
     context.moveTo(cx - 24, 0);
-    context.lineTo(cx - 24, cy - 54);
+    context.lineTo(cx - 24, cy - roadWidth / 2 - 31);
   } else {
     context.moveTo(cx + 24, height);
-    context.lineTo(cx + 24, cy + 54);
+    context.lineTo(cx + 24, cy + roadWidth / 2 + 31);
   }
   context.stroke();
+  context.setLineDash([]);
   context.globalAlpha = 1;
-  context.beginPath();
-  if (direction.name === "WEST" || direction.name === "EAST") {
-    const stopX = cx + (direction.name === "WEST" ? -54 : 54);
-    const laneCenter = cy + (direction.name === "WEST" ? 24 : -24);
-    context.moveTo(stopX, laneCenter - 14);
-    context.lineTo(stopX, laneCenter + 14);
-  } else {
-    const stopY = cy + (direction.name === "NORTH" ? -54 : 54);
-    const laneCenter = cx + (direction.name === "NORTH" ? -24 : 24);
-    context.moveTo(laneCenter - 14, stopY);
-    context.lineTo(laneCenter + 14, stopY);
-  }
-  context.stroke();
 }
 
 function vehiclePosition(
@@ -512,6 +653,9 @@ function drawSignal(
   color: string
 ): void {
   context.save();
+  context.shadowColor = "#000000";
+  context.shadowBlur = 5;
+  context.shadowOffsetY = 2;
   context.translate(x, y);
   context.rotate(angle);
   context.fillStyle = "#050a11";
@@ -547,29 +691,104 @@ function drawVehicle(
   context.shadowBlur = 5;
   context.fillStyle = vehicle.color;
   context.beginPath();
-  context.roundRect(-halfW, -halfL, vehicle.width, vehicle.length, 4);
+  context.roundRect(-halfW, -halfL, vehicle.width, vehicle.length, vehicle.kind === "truck" ? 2 : 5);
   context.fill();
   context.shadowBlur = 0;
-  context.fillStyle = vehicle.kind === "ambulance" ? "#e2e8f0" : "#334155";
-  context.beginPath();
-  context.roundRect(-halfW + 2, -halfL + 5, vehicle.width - 4, Math.max(7, vehicle.length * 0.27), 3);
-  context.fill();
-  context.fillStyle = vehicle.kind === "ambulance" ? "#b91c1c" : "#0f172a";
-  context.fillRect(-halfW + 2, halfL - 8, vehicle.width - 4, 4);
-  context.fillStyle = "#f8fafc";
-  context.fillRect(-halfW + 1, -halfL + 2, 3, 3);
-  context.fillRect(halfW - 4, -halfL + 2, 3, 3);
   if (vehicle.kind === "ambulance") {
-    const flash = Math.floor(timestamp / 120 + vehicle.flashing) % 2 === 0;
-    context.fillStyle = flash ? "#ef4444" : "#3b82f6";
-    context.shadowColor = context.fillStyle;
-    context.shadowBlur = 8;
-    context.fillRect(-4, -halfL + 1, 4, 3);
-    context.fillStyle = flash ? "#3b82f6" : "#ef4444";
-    context.shadowColor = context.fillStyle;
-    context.fillRect(0, -halfL + 1, 4, 3);
+    drawAmbulance(context, halfW, halfL, timestamp, vehicle.flashing);
+  } else {
+    drawStandardVehicle(context, vehicle, halfW, halfL);
   }
   context.restore();
+}
+
+function drawStandardVehicle(
+  context: CanvasRenderingContext2D,
+  vehicle: CanvasVehicle,
+  halfW: number,
+  halfL: number
+): void {
+  const cabHeight = vehicle.kind === "truck" ? 12 : vehicle.kind === "suv" ? 11 : 9;
+  context.fillStyle = vehicle.kind === "truck" ? "#cbd5e1" : "#e2e8f0";
+  context.beginPath();
+  context.roundRect(-halfW + 2, -halfL + cabHeight, vehicle.width - 4, vehicle.length - cabHeight * 2, 3);
+  context.fill();
+  context.fillStyle = "#0f172a";
+  context.beginPath();
+  context.roundRect(-halfW + 3, -halfL + 4, vehicle.width - 6, cabHeight, 3);
+  context.fill();
+  if (vehicle.kind === "truck") {
+    context.fillStyle = "#475569";
+    context.fillRect(-halfW + 2, halfL - 11, vehicle.width - 4, 7);
+    context.strokeStyle = "#94a3b8";
+    context.lineWidth = 1;
+    context.strokeRect(-halfW + 3, halfL - 10, vehicle.width - 6, 5);
+  } else {
+    context.fillStyle = vehicle.kind === "suv" ? "#bfdbfe" : "#dbeafe";
+    context.beginPath();
+    context.roundRect(-halfW + 3, halfL - 10, vehicle.width - 6, 6, 2);
+    context.fill();
+  }
+  context.fillStyle = vehicle.color;
+  context.fillRect(-halfW + 1, -halfL + cabHeight + 2, 2, vehicle.length - cabHeight * 2 - 4);
+  context.fillRect(halfW - 3, -halfL + cabHeight + 2, 2, vehicle.length - cabHeight * 2 - 4);
+  context.fillStyle = "#fef3c7";
+  context.fillRect(-halfW + 1, -halfL + 1, 4, 2);
+  context.fillRect(halfW - 5, -halfL + 1, 4, 2);
+  context.fillStyle = "#ef4444";
+  context.fillRect(-halfW + 1, halfL - 3, 4, 2);
+  context.fillRect(halfW - 5, halfL - 3, 4, 2);
+}
+
+function drawAmbulance(
+  context: CanvasRenderingContext2D,
+  halfW: number,
+  halfL: number,
+  timestamp: number,
+  phase: number
+): void {
+  const pulse = (Math.sin(timestamp / 95 + phase) + 1) / 2;
+  context.save();
+  context.globalAlpha = 0.18 + pulse * 0.18;
+  context.strokeStyle = pulse > 0.5 ? "#ef4444" : "#3b82f6";
+  context.lineWidth = 2 + pulse * 2;
+  context.shadowColor = context.strokeStyle;
+  context.shadowBlur = 13;
+  context.beginPath();
+  context.arc(0, 0, halfL + 7 + pulse * 5, 0, Math.PI * 2);
+  context.stroke();
+  context.restore();
+
+  context.fillStyle = "#ffffff";
+  context.beginPath();
+  context.roundRect(-halfW + 2, -halfL + 9, halfW * 2 - 4, halfL * 2 - 15, 4);
+  context.fill();
+  context.fillStyle = "#b91c1c";
+  context.fillRect(-halfW + 2, 2, halfW * 2 - 4, 5);
+  context.fillRect(-2, -halfL + 16, 4, 14);
+  context.fillRect(-7, -halfL + 21, 14, 4);
+
+  context.fillStyle = "#bfdbfe";
+  context.beginPath();
+  context.roundRect(-halfW + 4, -halfL + 10, halfW * 2 - 8, 8, 2);
+  context.fill();
+  context.fillStyle = "#f8fafc";
+  context.fillRect(-halfW + 4, halfL - 6, halfW * 2 - 8, 3);
+  context.fillStyle = "#fef3c7";
+  context.fillRect(-halfW + 1, -halfL + 2, 5, 3);
+  context.fillRect(halfW - 6, -halfL + 2, 5, 3);
+  context.fillStyle = "#ef4444";
+  context.fillRect(-halfW + 1, halfL - 4, 5, 3);
+  context.fillRect(halfW - 6, halfL - 4, 5, 3);
+
+  const flashRed = Math.floor(timestamp / 125 + phase) % 2 === 0;
+  context.fillStyle = flashRed ? "#ef4444" : "#3b82f6";
+  context.shadowColor = context.fillStyle;
+  context.shadowBlur = 12;
+  context.fillRect(-5, -halfL + 2, 5, 4);
+  context.fillStyle = flashRed ? "#3b82f6" : "#ef4444";
+  context.shadowColor = context.fillStyle;
+  context.fillRect(0, -halfL + 2, 5, 4);
 }
 
 function drawDirectionLabel(

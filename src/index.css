@@ -443,7 +443,7 @@ body {
 .ticker-event i { flex: 0 0 5px; width: 5px; height: 5px; border-radius: 50%; background: #14b8a6; }.ticker-event i.phase { background: #06b6d4; }.ticker-event i.spillback { background: #ef4444; box-shadow: 0 0 8px #ef4444; }.ticker-event i.served { background: #22c55e; }
 .ticker-state { color: #708095; font-size: 7px; font-weight: 800; letter-spacing: .6px; }
 .scheduler-visual,.emergency-route-panel { padding: 15px; margin-bottom: 14px; }
-.scheduler-canvas { position: relative; height: 290px; margin-top: 12px; overflow: hidden; border: 1px solid #223344; border-radius: 9px; background: #0b1420; }
+.scheduler-canvas { position: relative; height: 290px; margin-top: 12px; overflow: hidden; border: 1px solid #223344; border-radius: 9px; background: #1E293B; }
 .scheduler-canvas svg { width: 100%; height: 100%; }.scheduler-overlay { position: absolute; right: 12px; bottom: 12px; display: flex; align-items: center; gap: 7px; padding: 8px 10px; color: #6de1a1; border: 1px solid #235c48; border-radius: 7px; background: #08130ee8; font-size: 8px; font-weight: 800; }
 .scheduler-overlay small { margin-left: 4px; color: #9aa8b7; font-size: 7px; font-weight: 500; }
 .svg-signal-flow { stroke-dasharray: 8 7; animation: signal-flow 1s linear infinite; }

@@ -50,24 +50,12 @@ const LANE_DOT: Record<Direction, string> = {
   WEST: "bg-amber-500 shadow-lg shadow-amber-500/50",
 };
 const LANE_COLOR: Record<Direction, string> = {
-  NORTH: "#d9667a",
-  EAST: "#5b8def",
-  SOUTH: "#9b7be0",
-  WEST: "#e0a04a",
-};
-const LANE_WINDSHIELD: Record<Direction, string> = {
-  NORTH: "#843e50",
-  EAST: "#34528d",
-  SOUTH: "#59458d",
-  WEST: "#855a2b",
+  NORTH: "#EC4899",
+  EAST: "#3B82F6",
+  SOUTH: "#8B5CF6",
+  WEST: "#F59E0B",
 };
 const LANE_SHORT: Record<Direction, string> = { NORTH: "N", EAST: "E", SOUTH: "S", WEST: "W" };
-const CAR_ROTATION: Record<Direction, number> = {
-  NORTH: 180,
-  EAST: -90,
-  SOUTH: 0,
-  WEST: 90,
-};
 
 const ALGO_LABEL: Record<Algo, string> = {
   STATIC: "Static Timers (Usual Traffic)",
@@ -120,6 +108,508 @@ const HeatSparkline: React.FC<{ values: number[]; color: string }> = ({
     </svg>
   );
 };
+
+interface RenderVehicle {
+  id: string;
+  lane: Direction;
+  progress: number;
+  sourceProgress: number;
+  speed: number;
+  width: number;
+  length: number;
+  color: string;
+  kind: "sedan" | "suv" | "bus" | "ambulance";
+}
+
+interface SimulationCanvasState {
+  snap: Snapshot;
+  scenarioMode: ScenarioMode;
+  heatmap: Record<Direction, HeatLane>;
+}
+
+const VEHICLE_GAP_PX = 14;
+const VEHICLE_SHAPES = [
+  { width: 14, length: 24, kind: "sedan" as const },
+  { width: 16, length: 28, kind: "suv" as const },
+  { width: 18, length: 40, kind: "bus" as const },
+];
+
+const TrafficSimulationCanvas: React.FC<SimulationCanvasState> = ({
+  snap,
+  scenarioMode,
+  heatmap,
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const stateRef = useRef({ snap, scenarioMode, heatmap });
+  useEffect(() => {
+    stateRef.current = { snap, scenarioMode, heatmap };
+  }, [snap, scenarioMode, heatmap]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+
+    const vehicles = new Map<string, RenderVehicle>();
+    let frameId = 0;
+    let previousFrame = 0;
+
+    const render = (timestamp: number) => {
+      const delta = previousFrame ? Math.min((timestamp - previousFrame) / 1000, 0.05) : 1 / 60;
+      previousFrame = timestamp;
+      const bounds = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, bounds.width);
+      const height = Math.max(1, bounds.height);
+      if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+      }
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const current = stateRef.current;
+      const simulation = current.snap;
+      const centerX = width / 2;
+      const centerY = height / 2;
+      const roadWidth = Math.min(112, Math.min(width, height) * 0.36);
+      const halfRoad = roadWidth / 2;
+
+      drawSimulationRoad(context, width, height, centerX, centerY, roadWidth);
+      if (current.scenarioMode === "HEATMAP") {
+        drawHeatOverlay(context, width, height, centerX, centerY, roadWidth, current.heatmap);
+      }
+
+      const activeVehicles = new Set<string>();
+      const lanes = new Map<Direction, RenderVehicle[]>(DIRECTIONS.map((lane) => [lane, []]));
+      simulation.cars.forEach((car) => {
+        const id = `car-${car.id}`;
+        activeVehicles.add(id);
+        let vehicle = vehicles.get(id);
+        if (!vehicle) {
+          const shape = VEHICLE_SHAPES[Math.abs(car.id) % VEHICLE_SHAPES.length];
+          vehicle = {
+            id,
+            lane: car.lane,
+            progress: simulationProgressToDistance(car.lane, car.progress, width, height, halfRoad, shape.length),
+            sourceProgress: car.progress,
+            speed: 0,
+            ...shape,
+            color: LANE_COLOR[car.lane],
+          };
+          vehicles.set(id, vehicle);
+        }
+        vehicle.lane = car.lane;
+        vehicle.sourceProgress = car.progress;
+        if (car.emergency) vehicle.kind = "ambulance";
+        (lanes.get(car.lane) ?? []).push(vehicle);
+      });
+
+      simulation.emergencyVehicles
+        .filter((vehicle) => vehicle.status !== "CLEARED" && vehicle.position < 100)
+        .forEach((ambulance, index) => {
+          const id = `ambulance-${ambulance.id}`;
+          activeVehicles.add(id);
+          let vehicle = vehicles.get(id);
+          if (!vehicle) {
+            vehicle = {
+              id,
+              lane: ambulance.lane,
+              progress: simulationProgressToDistance(ambulance.lane, ambulance.position, width, height, halfRoad, 40),
+              sourceProgress: ambulance.position,
+              speed: 0,
+              width: 18,
+              length: 40,
+              color: "#f8fafc",
+              kind: "ambulance",
+            };
+            vehicles.set(id, vehicle);
+          }
+          vehicle.lane = ambulance.lane;
+          vehicle.sourceProgress = ambulance.position;
+          vehicle.kind = "ambulance";
+          vehicle.width = 18;
+          vehicle.length = 40;
+          (lanes.get(ambulance.lane) ?? []).push(vehicle);
+        });
+
+      vehicles.forEach((vehicle, id) => {
+        if (!activeVehicles.has(id)) vehicles.delete(id);
+      });
+
+      DIRECTIONS.forEach((lane) => {
+        const laneVehicles = lanes.get(lane) ?? [];
+        laneVehicles.sort((first, second) => second.sourceProgress - first.sourceProgress);
+
+        let leader: RenderVehicle | undefined;
+        laneVehicles.forEach((vehicle) => {
+          let target = simulationProgressToDistance(
+            lane,
+            vehicle.sourceProgress,
+            width,
+            height,
+            halfRoad,
+            vehicle.length
+          );
+          if (leader) {
+            target = Math.min(target, leader.progress - (leader.length + vehicle.length) / 2 - VEHICLE_GAP_PX);
+          }
+          const difference = target - vehicle.progress;
+          const targetSpeed = Math.sign(difference) * Math.min(96, Math.sqrt(Math.abs(difference) * 2 * 180));
+          const speedChange = Math.max(-200 * delta, Math.min(200 * delta, targetSpeed - vehicle.speed));
+          vehicle.speed += speedChange;
+          let nextProgress = vehicle.progress + vehicle.speed * delta;
+          if ((target - vehicle.progress) * (target - nextProgress) <= 0) {
+            nextProgress = target;
+            vehicle.speed = 0;
+          }
+          vehicle.progress = nextProgress;
+          if (leader && vehicle.progress > leader.progress - (leader.length + vehicle.length) / 2 - VEHICLE_GAP_PX) {
+            vehicle.progress = leader.progress - (leader.length + vehicle.length) / 2 - VEHICLE_GAP_PX;
+            vehicle.speed = Math.min(0, vehicle.speed);
+          }
+          leader = vehicle;
+        });
+      });
+
+      drawSimulationSignals(context, simulation, centerX, centerY, halfRoad);
+      if (current.scenarioMode === "ACCIDENT" && simulation.incident) {
+        drawRoadIncident(context, simulation.incident.lane, centerX, centerY, halfRoad);
+      }
+      vehicles.forEach((vehicle) => {
+        const position = simulationVehiclePosition(vehicle, width, height);
+        drawSimulationVehicle(context, position.x, position.y, vehicle, timestamp);
+      });
+      frameId = window.requestAnimationFrame(render);
+    };
+
+    frameId = window.requestAnimationFrame(render);
+    return () => window.cancelAnimationFrame(frameId);
+  }, []);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="absolute inset-0 h-full w-full"
+      role="img"
+      aria-label="Live four-way traffic simulation with asphalt roads, lane markings, vehicles, signals, and emergency sirens"
+    />
+  );
+};
+
+function drawSimulationRoad(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  centerX: number,
+  centerY: number,
+  roadWidth: number
+): void {
+  const halfRoad = roadWidth / 2;
+  context.fillStyle = "#1E293B";
+  context.fillRect(0, 0, width, height);
+  context.fillStyle = "#0F172A";
+  context.fillRect(centerX - halfRoad, 0, roadWidth, height);
+  context.fillRect(0, centerY - halfRoad, width, roadWidth);
+
+  context.save();
+  context.globalAlpha = 0.12;
+  context.fillStyle = "#94A3B8";
+  for (let y = 7; y < height; y += 17) {
+    for (let x = 5 + (y % 11); x < width; x += 23) {
+      context.fillRect(x, y, 1.2, 1.2);
+    }
+  }
+  context.restore();
+
+  context.strokeStyle = "rgba(226,232,240,0.82)";
+  context.lineWidth = 1.6;
+  context.setLineDash([11, 10]);
+  context.beginPath();
+  context.moveTo(centerX, 0);
+  context.lineTo(centerX, centerY - halfRoad - 30);
+  context.moveTo(centerX, centerY + halfRoad + 30);
+  context.lineTo(centerX, height);
+  context.moveTo(0, centerY);
+  context.lineTo(centerX - halfRoad - 30, centerY);
+  context.moveTo(centerX + halfRoad + 30, centerY);
+  context.lineTo(width, centerY);
+  context.stroke();
+  context.setLineDash([]);
+
+  drawZebraCrossing(context, centerX - halfRoad - 27, centerY, roadWidth, true);
+  drawZebraCrossing(context, centerX + halfRoad + 27, centerY, roadWidth, true);
+  drawZebraCrossing(context, centerX, centerY - halfRoad - 27, roadWidth, false);
+  drawZebraCrossing(context, centerX, centerY + halfRoad + 27, roadWidth, false);
+
+  context.strokeStyle = "#F8FAFC";
+  context.lineWidth = 3;
+  context.beginPath();
+  context.moveTo(centerX - halfRoad, centerY - halfRoad - 10);
+  context.lineTo(centerX, centerY - halfRoad - 10);
+  context.moveTo(centerX, centerY + halfRoad + 10);
+  context.lineTo(centerX + halfRoad, centerY + halfRoad + 10);
+  context.moveTo(centerX + halfRoad + 10, centerY - halfRoad);
+  context.lineTo(centerX + halfRoad + 10, centerY);
+  context.moveTo(centerX - halfRoad - 10, centerY);
+  context.lineTo(centerX - halfRoad - 10, centerY + halfRoad);
+  context.stroke();
+
+  context.save();
+  context.strokeStyle = "rgba(248,250,252,0.42)";
+  context.lineWidth = 1.5;
+  context.setLineDash([6, 7]);
+  context.beginPath();
+  context.moveTo(centerX - 17, centerY - 10);
+  context.quadraticCurveTo(centerX - 17, centerY - 2, centerX - 8, centerY + 8);
+  context.moveTo(centerX + 17, centerY + 10);
+  context.quadraticCurveTo(centerX + 17, centerY + 2, centerX + 8, centerY - 8);
+  context.moveTo(centerX - 10, centerY - 17);
+  context.quadraticCurveTo(centerX - 2, centerY - 17, centerX + 8, centerY - 8);
+  context.moveTo(centerX + 10, centerY + 17);
+  context.quadraticCurveTo(centerX + 2, centerY + 17, centerX - 8, centerY + 8);
+  context.stroke();
+  context.restore();
+}
+
+function drawZebraCrossing(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  roadWidth: number,
+  horizontal: boolean
+): void {
+  context.fillStyle = "rgba(248,250,252,0.92)";
+  for (let stripe = -3; stripe <= 3; stripe++) {
+    if (horizontal) context.fillRect(x - 3, y + stripe * 6, roadWidth + 6, 3);
+    else context.fillRect(x + stripe * 6, y - 3, 3, roadWidth + 6);
+  }
+}
+
+function drawHeatOverlay(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  centerX: number,
+  centerY: number,
+  roadWidth: number,
+  heatmap: Record<Direction, HeatLane>
+): void {
+  const halfRoad = roadWidth / 2;
+  DIRECTIONS.forEach((lane) => {
+    const color = HEAT_COLORS[heatLevel(heatmap[lane].score)];
+    context.save();
+    context.globalAlpha = 0.28;
+    const gradient = context.createLinearGradient(
+      lane === "NORTH" || lane === "SOUTH" ? centerX : lane === "WEST" ? 0 : width,
+      lane === "EAST" || lane === "WEST" ? centerY : lane === "NORTH" ? 0 : height,
+      centerX,
+      centerY
+    );
+    gradient.addColorStop(0, `${color}00`);
+    gradient.addColorStop(1, color);
+    context.fillStyle = gradient;
+    if (lane === "NORTH") context.fillRect(centerX - halfRoad, 0, roadWidth, centerY - halfRoad);
+    else if (lane === "SOUTH") context.fillRect(centerX - halfRoad, centerY + halfRoad, roadWidth, height);
+    else if (lane === "WEST") context.fillRect(0, centerY - halfRoad, centerX - halfRoad, roadWidth);
+    else context.fillRect(centerX + halfRoad, centerY - halfRoad, width, roadWidth);
+    context.restore();
+  });
+}
+
+function simulationProgressToDistance(
+  lane: Direction,
+  progress: number,
+  width: number,
+  height: number,
+  halfRoad: number,
+  vehicleLength: number
+): number {
+  const vertical = lane === "NORTH" || lane === "SOUTH";
+  const axisLength = (vertical ? height : width) * 0.9;
+  const entryDistance = (vertical ? height : width) * 0.05;
+  const stopDistanceFromOrigin = lane === "NORTH"
+    ? height / 2 - halfRoad - 10 - vehicleLength / 2 - entryDistance
+    : lane === "SOUTH"
+    ? height * 0.95 - (height / 2 + halfRoad + 10 + vehicleLength / 2)
+    : lane === "EAST"
+    ? width * 0.95 - (width / 2 + halfRoad + 10 + vehicleLength / 2)
+    : width / 2 - halfRoad - 10 - vehicleLength / 2 - entryDistance;
+  const stopDistance = Math.max(0, Math.min(axisLength, stopDistanceFromOrigin));
+  const stopProgress = STOP_LINE[lane];
+  const clampedProgress = Math.max(0, Math.min(100, progress));
+  if (clampedProgress <= stopProgress) {
+    return (clampedProgress / stopProgress) * stopDistance;
+  }
+  return stopDistance +
+    ((clampedProgress - stopProgress) / (100 - stopProgress)) *
+    (axisLength - stopDistance);
+}
+
+function drawSimulationSignals(
+  context: CanvasRenderingContext2D,
+  snap: Snapshot,
+  centerX: number,
+  centerY: number,
+  halfRoad: number
+): void {
+  const colors: Record<Direction, string> = {
+    NORTH: "#ef4444",
+    EAST: "#ef4444",
+    SOUTH: "#ef4444",
+    WEST: "#ef4444",
+  };
+  DIRECTIONS.forEach((lane) => {
+    if (snap.emergencyState !== "IDLE") {
+      if (snap.emergencyState === "CLEARING_TO_EMERGENCY" && snap.signalPhase === "YELLOW" && snap.lastLane === lane) {
+        colors[lane] = "#f59e0b";
+      } else if (snap.emergencyState === "ACTIVE" && snap.active === lane) {
+        colors[lane] = "#22c55e";
+      }
+    } else if (snap.signalPhase === "GREEN" && snap.active === lane) {
+      colors[lane] = "#22c55e";
+    } else if (snap.signalPhase === "YELLOW" && snap.lastLane === lane) {
+      colors[lane] = "#f59e0b";
+    }
+  });
+
+  const lights: Record<Direction, [number, number]> = {
+    NORTH: [centerX - halfRoad - 15, centerY - halfRoad - 12],
+    SOUTH: [centerX + halfRoad + 15, centerY + halfRoad + 12],
+    EAST: [centerX + halfRoad + 12, centerY - halfRoad - 15],
+    WEST: [centerX - halfRoad - 12, centerY + halfRoad + 15],
+  };
+  DIRECTIONS.forEach((lane) => {
+    const [x, y] = lights[lane];
+    context.fillStyle = "#020617";
+    context.beginPath();
+    context.roundRect(x - 6, y - 6, 12, 12, 4);
+    context.fill();
+    context.fillStyle = colors[lane];
+    context.shadowColor = colors[lane];
+    context.shadowBlur = 10;
+    context.beginPath();
+    context.arc(x, y, 3.3, 0, Math.PI * 2);
+    context.fill();
+    context.shadowBlur = 0;
+  });
+}
+
+function simulationVehiclePosition(
+  vehicle: RenderVehicle,
+  width: number,
+  height: number
+): { x: number; y: number } {
+  switch (vehicle.lane) {
+    case "NORTH":
+      return { x: width / 2 - 22, y: height * 0.05 + vehicle.progress };
+    case "SOUTH":
+      return { x: width / 2 + 22, y: height * 0.95 - vehicle.progress };
+    case "EAST":
+      return { x: width * 0.95 - vehicle.progress, y: height / 2 - 22 };
+    case "WEST":
+      return { x: width * 0.05 + vehicle.progress, y: height / 2 + 22 };
+  }
+}
+
+function drawSimulationVehicle(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  vehicle: RenderVehicle,
+  timestamp: number
+): void {
+  const rotation: Record<Direction, number> = { NORTH: Math.PI, EAST: -Math.PI / 2, SOUTH: 0, WEST: Math.PI / 2 };
+  context.save();
+  context.translate(x, y);
+  context.rotate(rotation[vehicle.lane]);
+  const halfWidth = vehicle.width / 2;
+  const halfLength = vehicle.length / 2;
+
+  if (vehicle.kind === "ambulance") {
+    const pulse = 0.5 + (Math.sin(timestamp / 100) + 1) * 0.25;
+    context.save();
+    context.globalAlpha = pulse;
+    context.strokeStyle = timestamp % 500 < 250 ? "#ef4444" : "#3b82f6";
+    context.lineWidth = 2;
+    context.shadowColor = context.strokeStyle;
+    context.shadowBlur = 14;
+    context.beginPath();
+    context.ellipse(0, 0, halfWidth + 7, halfLength + 7, 0, 0, Math.PI * 2);
+    context.stroke();
+    context.restore();
+  }
+
+  context.shadowColor = vehicle.kind === "ambulance" ? "rgba(248,250,252,0.85)" : `${vehicle.color}99`;
+  context.shadowBlur = vehicle.kind === "ambulance" ? 9 : 5;
+  context.fillStyle = vehicle.kind === "ambulance" ? "#f8fafc" : vehicle.color;
+  context.strokeStyle = vehicle.kind === "ambulance" ? "#fee2e2" : "#0f172a";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.roundRect(-halfWidth, -halfLength, vehicle.width, vehicle.length, 4);
+  context.fill();
+  context.stroke();
+  context.shadowBlur = 0;
+
+  context.fillStyle = vehicle.kind === "ambulance" ? "#bfdbfe" : "#0f172a";
+  context.globalAlpha = vehicle.kind === "ambulance" ? 0.9 : 0.82;
+  context.beginPath();
+  context.roundRect(-halfWidth + 2.5, -halfLength + 4, vehicle.width - 5, Math.max(7, vehicle.length * 0.25), 2);
+  context.fill();
+  context.globalAlpha = 1;
+
+  if (vehicle.kind === "ambulance") {
+    context.fillStyle = "#dc2626";
+    context.fillRect(-1.7, -4, 3.4, 11);
+    context.fillRect(-5.5, -0.2, 11, 3.4);
+    context.fillRect(-halfWidth + 1, halfLength - 8, vehicle.width - 2, 2.5);
+    context.fillStyle = timestamp % 500 < 250 ? "#ef4444" : "#2563eb";
+    context.shadowColor = context.fillStyle;
+    context.shadowBlur = 8;
+    context.fillRect(-5, -halfLength + 1, 4.5, 2.5);
+    context.fillStyle = timestamp % 500 < 250 ? "#2563eb" : "#ef4444";
+    context.fillRect(0.5, -halfLength + 1, 4.5, 2.5);
+    context.shadowBlur = 0;
+  } else {
+    context.fillStyle = "#f8fafc";
+    context.globalAlpha = 0.76;
+    context.fillRect(-halfWidth + 2, halfLength - 7, vehicle.width - 4, 1.5);
+    context.globalAlpha = 1;
+  }
+
+  context.restore();
+}
+
+function drawRoadIncident(
+  context: CanvasRenderingContext2D,
+  lane: Direction,
+  centerX: number,
+  centerY: number,
+  halfRoad: number
+): void {
+  const marker: Record<Direction, [number, number]> = {
+    NORTH: [centerX - 22, centerY - halfRoad - 14],
+    SOUTH: [centerX + 22, centerY + halfRoad + 14],
+    EAST: [centerX + halfRoad + 14, centerY - 22],
+    WEST: [centerX - halfRoad - 14, centerY + 22],
+  };
+  const [x, y] = marker[lane];
+  context.save();
+  context.translate(x, y);
+  context.rotate(-Math.PI / 4);
+  context.fillStyle = "#f59e0b";
+  context.strokeStyle = "#fff7ed";
+  context.lineWidth = 2;
+  context.shadowColor = "#ef4444";
+  context.shadowBlur = 14;
+  context.fillRect(-11, -11, 22, 22);
+  context.strokeRect(-11, -11, 22, 22);
+  context.shadowBlur = 0;
+  context.fillStyle = "#7f1d1d";
+  context.fillRect(-2, -8, 4, 16);
+  context.fillRect(-8, -2, 16, 4);
+  context.restore();
+}
 
 interface BenchmarkReading {
   algo: BenchmarkAlgo;
@@ -600,20 +1090,6 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const setLane = (lane: Direction, patch: Partial<Setup[Direction]>) =>
     setSetup((prev) => ({ ...prev, [lane]: { ...prev[lane], ...patch } }));
 
-  const getVehicleStyle = (lane: Direction, progress: number) => {
-    const visibleProgress = Math.min(95, Math.max(5, 5 + progress * 0.9));
-    switch (lane) {
-      case "NORTH":
-        return { top: `${visibleProgress}%`, left: "48%" };
-      case "SOUTH":
-        return { bottom: `${visibleProgress}%`, left: "52%" };
-      case "EAST":
-        return { right: `${visibleProgress}%`, top: "48%" };
-      case "WEST":
-        return { left: `${visibleProgress}%`, top: "52%" };
-    }
-  };
-
   const handleAlgoChange = (algo: Algo) => {
     setEventSimTime(simRef.current.clock);
     addEvent({
@@ -716,6 +1192,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   };
 
   const hasAmbulance = (lane: Direction) =>
+    snap.cars.some((car) => car.lane === lane && car.emergency) ||
     snap.emergencyVehicles.some(
       (vehicle) =>
         vehicle.lane === lane &&
@@ -723,9 +1200,24 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
         vehicle.status !== "RECOVERY"
     );
 
+  const queuedByLane = DIRECTIONS.reduce<Record<Direction, number>>(
+    (counts, lane) => {
+      counts[lane] = snap.cars.filter((car) => car.lane === lane && !car.released).length;
+      return counts;
+    },
+    { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 }
+  );
+
   const inTransitByLane = DIRECTIONS.reduce<Record<Direction, number>>(
     (counts, lane) => {
-      counts[lane] = snap.cars.filter((car) => car.lane === lane && car.released).length;
+      counts[lane] =
+        snap.cars.filter((car) => car.lane === lane && car.released).length +
+        snap.emergencyVehicles.filter(
+          (vehicle) =>
+            vehicle.lane === lane &&
+            vehicle.status !== "CLEARED" &&
+            vehicle.status !== "RECOVERY"
+        ).length;
       return counts;
     },
     { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 }
@@ -1415,83 +1907,31 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
         {/* Right Canvas and Analytics Panel */}
         <div className="lg:col-span-8 p-5 rounded-2xl bg-slate-900/90 backdrop-blur-xl border border-slate-800 flex flex-col justify-between shadow-xl">
           {/* Intersection Canvas */}
-          <div className="relative w-full h-80 bg-slate-950 rounded-2xl border border-slate-800 overflow-hidden flex items-center justify-center shadow-inner">
-            {/* Roads */}
-            <div className="absolute w-24 h-full bg-slate-900/90 border-x border-dashed border-slate-700/50 flex justify-center">
-              <div className="absolute w-0.5 h-full bg-amber-400/20" />
-            </div>
-            <div className="absolute h-24 w-full bg-slate-900/90 border-y border-dashed border-slate-700/50 flex items-center">
-              <div className="absolute w-full h-0.5 bg-amber-400/20" />
-            </div>
+          <div className="relative isolate w-full h-[420px] bg-slate-950 rounded-2xl border border-slate-800 overflow-hidden shadow-inner">
+            <TrafficSimulationCanvas snap={snap} scenarioMode={scenarioMode} heatmap={heatmap} />
             {scenarioMode === "HEATMAP" && (
-              <>
-                {DIRECTIONS.map((lane) => {
-                  const color = HEAT_COLORS[heatLevel(heatmap[lane].score)];
-                  const gradient = `linear-gradient(${
-                    lane === "NORTH" ? "to bottom" :
-                    lane === "SOUTH" ? "to top" :
-                    lane === "WEST" ? "to right" : "to left"
-                  }, ${color} 0%, ${color}00 100%)`;
-                  const position: React.CSSProperties =
-                    lane === "NORTH"
-                      ? { left: "47%", top: 0, width: "6%", height: "40%" }
-                      : lane === "SOUTH"
-                      ? { left: "47%", bottom: 0, width: "6%", height: "40%" }
-                      : lane === "WEST"
-                      ? { left: 0, top: "47%", width: "40%", height: "6%" }
-                      : { right: 0, top: "47%", width: "40%", height: "6%" };
-                  const chipPosition: React.CSSProperties =
-                    lane === "NORTH"
-                      ? { left: "50%", top: "38%", transform: "translateX(-50%)" }
-                      : lane === "SOUTH"
-                      ? { left: "50%", bottom: "38%", transform: "translateX(-50%)" }
-                      : lane === "WEST"
-                      ? { left: "35%", top: "50%", transform: "translateY(-50%)" }
-                      : { right: "35%", top: "50%", transform: "translateY(-50%)" };
-                  return (
-                    <React.Fragment key={`heat-${lane}`}>
-                      <div
-                        aria-hidden="true"
-                        className="absolute z-[1] pointer-events-none"
-                        style={{ ...position, backgroundImage: gradient, opacity: 0.3 }}
-                      />
-                      <div
-                        className="absolute z-[4] rounded-md border px-1.5 py-1 text-[8px] font-black shadow-lg"
-                        style={{
-                          ...chipPosition,
-                          borderColor: `${color}88`,
-                          backgroundColor: "rgba(2,6,23,0.9)",
-                          color,
-                        }}
-                      >
-                        {lane} · {Math.round(heatmap[lane].score)}% · {heatLevel(heatmap[lane].score)}
-                      </div>
-                    </React.Fragment>
-                  );
-                })}
-                <div className="absolute bottom-2 right-2 z-[5] flex gap-2 rounded-lg border border-slate-700 bg-slate-950/90 px-2 py-1 text-[8px] font-bold text-slate-200">
-                  {(["FREE", "MODERATE", "HEAVY"] as HeatLevel[]).map((level) => (
-                    <span key={level} className="flex items-center gap-1">
-                      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: HEAT_COLORS[level] }} />
-                      {level}
-                    </span>
-                  ))}
-                </div>
-              </>
+              <div className="absolute bottom-2 right-2 z-[5] flex gap-2 rounded-lg border border-slate-700 bg-slate-950/90 px-2 py-1 text-[8px] font-bold text-slate-200">
+                {(["FREE", "MODERATE", "HEAVY"] as HeatLevel[]).map((level) => (
+                  <span key={level} className="flex items-center gap-1">
+                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: HEAT_COLORS[level] }} />
+                    {level}
+                  </span>
+                ))}
+              </div>
             )}
 
             {/* Signal Labels */}
             <div className="absolute top-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
-              NORTH: {signalOf("NORTH")} · {snap.queued.NORTH} QUEUED · {inTransitByLane.NORTH} MOVING {hasAmbulance("NORTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
+              NORTH: {signalOf("NORTH")} · {queuedByLane.NORTH} QUEUED · {inTransitByLane.NORTH} MOVING {hasAmbulance("NORTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
             <div className="absolute bottom-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
-              SOUTH: {signalOf("SOUTH")} · {snap.queued.SOUTH} QUEUED · {inTransitByLane.SOUTH} MOVING {hasAmbulance("SOUTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
+              SOUTH: {signalOf("SOUTH")} · {queuedByLane.SOUTH} QUEUED · {inTransitByLane.SOUTH} MOVING {hasAmbulance("SOUTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
             <div className="absolute left-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
-              WEST: {signalOf("WEST")} · {snap.queued.WEST} QUEUED · {inTransitByLane.WEST} MOVING {hasAmbulance("WEST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
+              WEST: {signalOf("WEST")} · {queuedByLane.WEST} QUEUED · {inTransitByLane.WEST} MOVING {hasAmbulance("WEST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
             <div className="absolute right-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
-              EAST: {signalOf("EAST")} · {snap.queued.EAST} QUEUED · {inTransitByLane.EAST} MOVING {hasAmbulance("EAST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
+              EAST: {signalOf("EAST")} · {queuedByLane.EAST} QUEUED · {inTransitByLane.EAST} MOVING {hasAmbulance("EAST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
 
             {scenarioMode === "ACCIDENT" && snap.incident && (
@@ -1503,98 +1943,8 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                   ACCIDENT: {snap.incident.lane} lane blocked
                   {incidentRemaining === null ? " · clears when manually cleared" : ` · clears in ${Math.ceil(incidentRemaining)}s`}
                 </div>
-                <div
-                  aria-label={`${snap.incident.type.replace("_", " ")} blocking ${snap.incident.lane} lane`}
-                  className={`absolute z-[5] flex h-7 w-10 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded border-2 border-amber-200 shadow-lg ${
-                    snap.incident.type === "ROAD_BLOCK"
-                      ? "bg-amber-800"
-                      : "bg-rose-800"
-                  }`}
-                  style={{
-                    ...getVehicleStyle(snap.incident.lane, STOP_LINE[snap.incident.lane]),
-                  }}
-                >
-                  {snap.incident.type === "ROAD_BLOCK" ? (
-                    <span className="h-full w-full animate-pulse bg-[repeating-linear-gradient(135deg,#fbbf24_0_5px,#713f12_5px_10px)]" />
-                  ) : (
-                    <span className="flex -rotate-12 gap-0.5">
-                      <span className="h-3 w-4 rounded-sm border border-amber-200 bg-rose-400" />
-                      {snap.incident.type === "ACCIDENT" && (
-                        <span className="mt-1 h-3 w-4 rotate-12 rounded-sm border border-amber-200 bg-slate-400" />
-                      )}
-                    </span>
-                  )}
-                  <span className="absolute -right-1 -top-1 h-2 w-2 animate-ping rounded-full bg-amber-300" />
-                </div>
               </>
             )}
-
-            {/* Moving Vehicles */}
-            {snap.cars.map((v) => (
-              <div
-                key={v.id}
-                aria-label={`${v.emergency ? "Emergency vehicle" : `${v.lane} lane vehicle`} ${v.released ? "in transit" : "queued"}`}
-                className="absolute z-[2] h-6 w-4 transition-[top,right,bottom,left] duration-75 ease-linear will-change-[top,left,right,bottom]"
-                style={{
-                  ...getVehicleStyle(v.lane, v.progress),
-                  transform: "translate(-50%, -50%)",
-                }}
-              >
-                {v.emergency ? (
-                  <div
-                    aria-label="Ambulance"
-                    className="relative flex h-full w-full items-center justify-center text-lg drop-shadow-lg"
-                    style={{ transform: `rotate(${CAR_ROTATION[v.lane]}deg)` }}
-                  >
-                    🚑
-                    <span className="absolute left-1/2 top-0 h-1.5 w-1.5 -translate-x-1/2 rounded-full bg-rose-500 animate-ping" />
-                    <span className="absolute left-1/2 top-0 h-1.5 w-1.5 translate-x-1 rounded-full bg-blue-500 animate-ping" />
-                  </div>
-                ) : (
-                  <svg
-                    viewBox="0 0 20 30"
-                    aria-hidden="true"
-                    className="w-full h-full drop-shadow-md"
-                    style={{ transform: `rotate(${CAR_ROTATION[v.lane]}deg)` }}
-                  >
-                    <path
-                      d="M6 1.5h8l3 5v17l-3 5H6l-3-5v-17l3-5Z"
-                      fill={LANE_COLOR[v.lane]}
-                      stroke="#0f172a"
-                      strokeWidth="1.2"
-                    />
-                    <path d="M5 8h10v7H5z" fill={LANE_WINDSHIELD[v.lane]} opacity="0.95" />
-                    <path d="M5 18h10v3H5z" fill="#0f172a" opacity="0.8" />
-                    <circle cx="5.2" cy="4.5" r="1" fill="#f8df9d" />
-                    <circle cx="14.8" cy="4.5" r="1" fill="#f8df9d" />
-                    <circle cx="5.2" cy="25.5" r="1" fill="#d66b72" />
-                    <circle cx="14.8" cy="25.5" r="1" fill="#d66b72" />
-                  </svg>
-                )}
-              </div>
-            ))}
-            {snap.emergencyVehicles
-              .filter((vehicle) => vehicle.status !== "CLEARED" && vehicle.position < 100)
-              .map((vehicle) => (
-                <div
-                  key={vehicle.id}
-                  aria-label={`${vehicle.id} emergency vehicle on ${vehicle.lane}`}
-                  className="absolute z-[3] h-7 w-7 transition-[top,right,bottom,left] duration-75 ease-linear will-change-[top,left,right,bottom]"
-                  style={{
-                    ...getVehicleStyle(vehicle.lane, vehicle.position),
-                    transform: "translate(-50%, -50%)",
-                  }}
-                >
-                  <div
-                    className="relative flex h-full w-full items-center justify-center rounded-lg border border-white/90 bg-rose-600 text-base shadow-[0_0_16px_rgba(244,63,94,0.8)]"
-                    style={{ transform: `rotate(${CAR_ROTATION[vehicle.lane]}deg)` }}
-                  >
-                    🚑
-                    <span className="absolute left-1 top-0.5 h-1.5 w-1.5 animate-ping rounded-full bg-white" />
-                    <span className="absolute right-1 top-0.5 h-1.5 w-1.5 animate-ping rounded-full bg-cyan-300" />
-                  </div>
-                </div>
-              ))}
           </div>
 
           <section className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/60 p-3.5">
