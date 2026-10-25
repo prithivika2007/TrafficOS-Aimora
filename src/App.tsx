@@ -6,7 +6,6 @@ import { twMerge } from "tailwind-merge";
 import {
   Activity,
   AlertTriangle,
-  Ambulance,
   BarChart3,
   BookOpen,
   ChevronDown,
@@ -25,6 +24,7 @@ import {
   Zap,
 } from "lucide-react";
 import LiveTrafficConsole from "./components/LiveTrafficConsole";
+import EmergencyLab from "./components/EmergencyLab";
 import SplashScreen from "./components/SplashScreen";
 import { TrafficProvider, useTraffic } from "./TrafficContext";
 import { JUNCTIONS, JUNCTION_NAMES, ROAD_CAPACITY, ROAD_DEFINITIONS, networkMetrics } from "./networkEngine";
@@ -111,14 +111,6 @@ function DashboardShell(): React.JSX.Element {
   }, []);
   const currentQueueCount = Object.values(states[mode].roads).reduce((sum, vehicles) => sum + vehicles.length, 0)
     + JUNCTIONS.reduce((sum, junction) => sum + states[mode].demand[junction].length, 0);
-
-  useEffect(() => {
-    if (activePage !== "emergency") return;
-    const timer = window.setTimeout(() => {
-      document.getElementById("ambulance-lab-title")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [activePage]);
 
   const navigate = useCallback((page: PageId) => {
     setActivePage(page);
@@ -215,13 +207,14 @@ function DashboardShell(): React.JSX.Element {
         <h1>{PAGE_TITLES[activePage]}</h1>
         <p className={activePage === "scheduler" ? "text-sm font-medium text-slate-300" : ""}>
           {activePage === "emergency"
-            ? "Test ambulance detection, safe signal preemption, and scheduler recovery."
+            ? "Test ambulance arrivals, safe signal preemption, and recovery on a dedicated hospital corridor."
             : "Evaluate Round Robin, static timers, and priority aging at a single junction."}
         </p>
       </div>
     </div>
-    {activePage === "emergency" && <EmergencyRouteVisual />}
-    <TrafficOSSimulator simulationRef={simulationRef} simulationRevision={simulationRevision} />
+    {activePage === "emergency"
+      ? <EmergencyLab />
+      : <TrafficOSSimulator simulationRef={simulationRef} simulationRevision={simulationRevision} />}
     <div className="sim-disclaimer">SIMULATION MODEL — SYNTHETIC TRAFFIC DATA FOR ALGORITHMIC BENCHMARKING</div>
   </div>
 )}
@@ -229,7 +222,7 @@ function DashboardShell(): React.JSX.Element {
           {activePage === "incidents" && <TrafficIncidents />}
           {activePage === "analytics" && <TrafficAnalytics />}
           {activePage === "learn" && <LearnPage navigate={navigate} />}
-          {activePage === "console" && <div className="legacy-console panel"><div className="page-heading"><div><p className="eyebrow">CONNECTED SYSTEMS</p><h1>Live traffic console</h1><p>Demo, uploaded, and live camera video with on-device vehicle detection overlays.</p></div></div><LiveTrafficConsole simulationRef={simulationRef} /></div>}
+          {activePage === "console" && <div className="legacy-console panel"><div className="page-heading"><div><p className="eyebrow">CONNECTED SYSTEMS</p><h1>Live traffic console</h1><p>Demo, uploaded, and live camera video with simulation signal telemetry.</p></div></div><LiveTrafficConsole simulationRef={simulationRef} /></div>}
           </React.Suspense>
           </motion.div>
           </AnimatePresence>
@@ -322,8 +315,7 @@ interface CanvasVehicle {
   width: number;
   length: number;
   color: string;
-  kind: "sedan" | "suv" | "truck" | "ambulance";
-  flashing: number;
+  kind: "sedan" | "suv" | "truck";
 }
 
 const APPROACH_COLORS = ["#EC4899", "#3B82F6", "#8B5CF6", "#F59E0B"];
@@ -339,17 +331,13 @@ function SchedulerTrafficCanvas({
   phaseTicks,
   allRed,
   approachCounts,
-  emergencySpawnId,
 }: {
   phase: number;
   phaseTicks: number;
   allRed: boolean;
   approachCounts: number[];
-  emergencySpawnId: string | null;
 }): React.JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const vehiclesRef = useRef<CanvasVehicle[][]>([]);
-  const handledEmergency = useRef<string | null>(null);
   const liveRef = useRef({ phase, phaseTicks, allRed, approachCounts });
   useEffect(() => {
     liveRef.current = { phase, phaseTicks, allRed, approachCounts };
@@ -367,11 +355,9 @@ function SchedulerTrafficCanvas({
           color: APPROACH_COLORS[lane],
           progress: 0,
           speed: 0,
-          flashing: Math.random() * Math.PI * 2,
         } satisfies CanvasVehicle;
       })
     );
-    vehiclesRef.current = vehicles;
     let animationFrame = 0;
     let lastFrame = 0;
     let initialized = false;
@@ -444,7 +430,7 @@ function SchedulerTrafficCanvas({
             vehicle.speed = 0;
           }
           const position = vehiclePosition(direction.name, vehicle.progress, centerX, centerY, width, height);
-          drawVehicle(context, position.x, position.y, direction.angle, vehicle, timestamp);
+          drawVehicle(context, position.x, position.y, direction.angle, vehicle);
         });
         drawDirectionLabel(context, direction.name, direction.color, live.approachCounts[lane] ?? 0, width, height, lane);
       });
@@ -453,29 +439,6 @@ function SchedulerTrafficCanvas({
     animationFrame = window.requestAnimationFrame(draw);
     return () => window.cancelAnimationFrame(animationFrame);
   }, []);
-
-  useEffect(() => {
-    if (!emergencySpawnId) {
-      handledEmergency.current = null;
-      return;
-    }
-    if (handledEmergency.current === emergencySpawnId) return;
-    const laneVehicles = vehiclesRef.current[3];
-    if (!laneVehicles) return;
-    handledEmergency.current = emergencySpawnId;
-    const ambulance: CanvasVehicle = {
-      progress: Math.min(...laneVehicles.map((vehicle) =>
-        vehicle.progress - (vehicle.length + 40) / 2 - MIN_VEHICLE_GAP
-      )),
-      speed: 0,
-      width: 18,
-      length: 40,
-      color: "#f8fafc",
-      kind: "ambulance",
-      flashing: Math.random() * Math.PI * 2,
-    };
-    laneVehicles.push(ambulance);
-  }, [emergencySpawnId]);
 
   return <canvas ref={canvasRef} className="scheduler-traffic-canvas" role="img" aria-label="Continuously animated four-way traffic intersection with directional vehicle queues" />;
 }
@@ -688,8 +651,7 @@ function drawVehicle(
   x: number,
   y: number,
   angle: number,
-  vehicle: CanvasVehicle,
-  timestamp: number
+  vehicle: CanvasVehicle
 ): void {
   context.save();
   context.translate(x, y);
@@ -703,11 +665,7 @@ function drawVehicle(
   context.roundRect(-halfW, -halfL, vehicle.width, vehicle.length, vehicle.kind === "truck" ? 2 : 5);
   context.fill();
   context.shadowBlur = 0;
-  if (vehicle.kind === "ambulance") {
-    drawAmbulance(context, halfW, halfL, timestamp, vehicle.flashing);
-  } else {
-    drawStandardVehicle(context, vehicle, halfW, halfL);
-  }
+  drawStandardVehicle(context, vehicle, halfW, halfL);
   context.restore();
 }
 
@@ -749,57 +707,6 @@ function drawStandardVehicle(
   context.fillRect(halfW - 5, halfL - 3, 4, 2);
 }
 
-function drawAmbulance(
-  context: CanvasRenderingContext2D,
-  halfW: number,
-  halfL: number,
-  timestamp: number,
-  phase: number
-): void {
-  const pulse = (Math.sin(timestamp / 95 + phase) + 1) / 2;
-  context.save();
-  context.globalAlpha = 0.18 + pulse * 0.18;
-  context.strokeStyle = pulse > 0.5 ? "#ef4444" : "#3b82f6";
-  context.lineWidth = 2 + pulse * 2;
-  context.shadowColor = context.strokeStyle;
-  context.shadowBlur = 13;
-  context.beginPath();
-  context.arc(0, 0, halfL + 7 + pulse * 5, 0, Math.PI * 2);
-  context.stroke();
-  context.restore();
-
-  context.fillStyle = "#ffffff";
-  context.beginPath();
-  context.roundRect(-halfW + 2, -halfL + 9, halfW * 2 - 4, halfL * 2 - 15, 4);
-  context.fill();
-  context.fillStyle = "#b91c1c";
-  context.fillRect(-halfW + 2, 2, halfW * 2 - 4, 5);
-  context.fillRect(-2, -halfL + 16, 4, 14);
-  context.fillRect(-7, -halfL + 21, 14, 4);
-
-  context.fillStyle = "#bfdbfe";
-  context.beginPath();
-  context.roundRect(-halfW + 4, -halfL + 10, halfW * 2 - 8, 8, 2);
-  context.fill();
-  context.fillStyle = "#f8fafc";
-  context.fillRect(-halfW + 4, halfL - 6, halfW * 2 - 8, 3);
-  context.fillStyle = "#fef3c7";
-  context.fillRect(-halfW + 1, -halfL + 2, 5, 3);
-  context.fillRect(halfW - 6, -halfL + 2, 5, 3);
-  context.fillStyle = "#ef4444";
-  context.fillRect(-halfW + 1, halfL - 4, 5, 3);
-  context.fillRect(halfW - 6, halfL - 4, 5, 3);
-
-  const flashRed = Math.floor(timestamp / 125 + phase) % 2 === 0;
-  context.fillStyle = flashRed ? "#ef4444" : "#3b82f6";
-  context.shadowColor = context.fillStyle;
-  context.shadowBlur = 12;
-  context.fillRect(-5, -halfL + 2, 5, 4);
-  context.fillStyle = flashRed ? "#3b82f6" : "#ef4444";
-  context.shadowColor = context.fillStyle;
-  context.fillRect(0, -halfL + 2, 5, 4);
-}
-
 function drawDirectionLabel(
   context: CanvasRenderingContext2D,
   direction: string,
@@ -818,23 +725,6 @@ function drawDirectionLabel(
   context.font = "600 11px Inter, sans-serif";
   context.fillStyle = color;
   context.fillText(`${direction} · ${count} waiting`, labels[index].x, labels[index].y);
-}
-
-function EmergencyRouteVisual(): React.JSX.Element {
-  const { states, mode, running } = useTraffic();
-  const state = states[mode];
-  const phaseIndex = running ? Math.floor((state.tick % 48) / 12) : 0;
-  const stages = ["NORMAL", "CLEARANCE", "PASSAGE", "RECOVERY"];
-  const junction = JUNCTIONS[Math.floor((state.tick / 12) % JUNCTIONS.length)];
-  return <section className="panel emergency-route-panel">
-    <div className="panel-heading"><div><p className="eyebrow">ISR PRIORITY ROUTE · AMB-911</p><h2>Emergency corridor telemetry</h2></div><span className={`severity high ${running ? "emergency-blink" : ""}`}>{stages[phaseIndex]}</span></div>
-    <div className={`emergency-route ${running ? "route-active" : ""}`}><div className="route-path" />
-      {JUNCTIONS.map((node, index) => <div className={`route-node ${node === junction ? "current" : ""}`} key={node} style={{ left: `${10 + index * 27}%` }}><span>{node === junction ? <Ambulance size={17} /> : node}</span><small>JUNCTION {node}</small></div>)}
-    </div>
-    <div className="isr-stages">{stages.map((stage, index) => <div key={stage} className={index === phaseIndex ? "active" : index < phaseIndex ? "complete" : ""}><span>{index + 1}</span><b>{stage}</b></div>)}</div>
-    <div className="starvation-monitor"><b><Zap size={14} /> Starved-lane aging monitor</b>{JUNCTIONS.map((node) => <span key={node}>J{node}<i><em style={{ width: `${Math.min(100, state.demand[node].length * 16)}%` }} /></i>{state.demand[node].length}</span>)}</div>
-    <p className="emergency-caption">AMB-911 route stages follow the shared simulation clock; use the established emergency lab controls below to exercise ISR requests.</p>
-  </section>;
 }
 
 function LearnPage({ navigate }: { navigate: (page: PageId) => void }): React.JSX.Element {
