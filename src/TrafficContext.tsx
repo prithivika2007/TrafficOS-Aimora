@@ -37,7 +37,7 @@ export interface TelemetryPoint {
 export interface TrafficEvent {
   id: string;
   tick: number;
-  kind: "arrival" | "served" | "phase" | "spillback";
+  kind: "arrival" | "served" | "phase" | "spillback" | "roadblock";
   message: string;
   junction: JunctionId;
 }
@@ -55,6 +55,7 @@ interface TrafficContextValue {
   pause: () => void;
   step: () => void;
   reset: () => void;
+  setRoadBlock: (roadId: string, blocked: boolean) => void;
   singleIntersection: MutableRefObject<Sim>;
   simulationRevision: number;
   notifySimulationUpdate: () => void;
@@ -202,6 +203,33 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     singleIntersection.current = createSim(defaultSetup(), "RR");
     setSimulationRevision((revision) => revision + 1);
   }, []);
+  const setRoadBlock = useCallback((roadId: string, blocked: boolean) => {
+    const road = ROAD_DEFINITIONS.find((item) => item.id === roadId);
+    if (!road) throw new Error(`Unknown road link: ${roadId}`);
+    const previous = statesRef.current;
+    if (
+      previous.independent.roadBlocks[roadId] === blocked &&
+      previous.coordinated.roadBlocks[roadId] === blocked
+    ) return;
+    const update = (state: NetworkState): NetworkState => ({
+      ...state,
+      roadBlocks: { ...state.roadBlocks, [roadId]: blocked },
+    });
+    const next = {
+      independent: update(previous.independent),
+      coordinated: update(previous.coordinated),
+    };
+    statesRef.current = next;
+    setStates(next);
+    const event: TrafficEvent = {
+      id: `roadblock-${roadId}-${blocked ? "active" : "cleared"}-${eventCounter.current++}`,
+      tick: previous[mode].tick,
+      kind: "roadblock",
+      message: `${road.from} → ${road.to} lane ${blocked ? "blocked; detours activated" : "reopened"}`,
+      junction: road.to,
+    };
+    setEvents((current) => [event, ...current].slice(0, 30));
+  }, [mode]);
 
   const value = useMemo<TrafficContextValue>(
     () => ({
@@ -217,11 +245,12 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
       pause,
       step,
       reset,
+      setRoadBlock,
       singleIntersection,
       simulationRevision,
       notifySimulationUpdate,
     }),
-    [states, history, events, running, mode, algorithm, start, pause, step, reset, simulationRevision, notifySimulationUpdate]
+    [states, history, events, running, mode, algorithm, start, pause, step, reset, setRoadBlock, simulationRevision, notifySimulationUpdate]
   );
   return <TrafficContext.Provider value={value}>{children}</TrafficContext.Provider>;
 }

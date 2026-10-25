@@ -25,6 +25,12 @@ export interface NetworkLinkState {
   spillback: boolean;
 }
 
+export interface SignalSafetyInspection {
+  clear: boolean;
+  conflicts: string[];
+  logs: string[];
+}
+
 export type NetworkAlgorithm = "ROUND_ROBIN" | "PRIORITY_AGING";
 
 export interface NetworkState {
@@ -36,6 +42,7 @@ export interface NetworkState {
   phaseTicks: Record<JunctionId, number>;
   laneWaitTicks: Record<string, number>;
   blockedRoads: Record<string, boolean>;
+  roadBlocks: Record<string, boolean>;
   spillbackEvents: { tick: number; roadId: string }[];
   served: number;
   waitSeconds: number;
@@ -46,7 +53,15 @@ export interface NetworkState {
 
 export const JUNCTIONS: JunctionId[] = ["A", "B", "C", "D"];
 export const SCENARIO_SEED = 2026;
-export const ROAD_CAPACITY = 12;
+export const MAX_CAPACITY = 12;
+export const ROAD_CAPACITY = MAX_CAPACITY;
+export const JUNCTION_NAMES: Record<JunctionId, string> = {
+  A: "Market & 8th",
+  B: "Mission & 5th",
+  C: "Mission & 8th",
+  D: "Market & 5th",
+};
+const COORDINATION_CAPACITY_THRESHOLD = 0.75;
 export const ROAD_DEFINITIONS: NetworkRoad[] = [
   { id: "AB", from: "A", to: "B", capacity: ROAD_CAPACITY },
   { id: "BA", from: "B", to: "A", capacity: ROAD_CAPACITY },
@@ -86,10 +101,11 @@ export const createNetworkState = (): NetworkState => ({
     ])
   ),
   demand: { A: [], B: [], C: [], D: [] },
-  phases: { A: 0, B: 1, C: 2, D: 3 },
+  phases: { A: 0, B: 1, C: 0, D: 1 },
   phaseTicks: { A: 0, B: 0, C: 0, D: 0 },
   laneWaitTicks: Object.fromEntries(ROAD_DEFINITIONS.map((road) => [road.id, 0])),
   blockedRoads: Object.fromEntries(ROAD_DEFINITIONS.map((road) => [road.id, false])),
+  roadBlocks: Object.fromEntries(ROAD_DEFINITIONS.map((road) => [road.id, false])),
   spillbackEvents: [],
   served: 0,
   waitSeconds: 0,
@@ -112,21 +128,55 @@ export const stepNetwork = (
     ...state,
     tick: state.tick + 1,
     roads: Object.fromEntries(
-      Object.entries(state.roads).map(([id, vehicles]) => [id, [...vehicles]])
+      Object.entries(state.roads).map(([id, vehicles]) => [
+        id,
+        vehicles.map((vehicle) => ({ ...vehicle, route: [...vehicle.route] })),
+      ])
     ),
     links: Object.fromEntries(
       Object.entries(state.links).map(([id, link]) => [id, { ...link }])
     ),
     demand: Object.fromEntries(
-      JUNCTIONS.map((junction) => [junction, [...state.demand[junction]]])
+      JUNCTIONS.map((junction) => [
+        junction,
+        state.demand[junction].map((vehicle) => ({ ...vehicle, route: [...vehicle.route] })),
+      ])
     ) as Record<JunctionId, NetworkVehicle[]>,
     phases: { ...state.phases },
     phaseTicks: { ...state.phaseTicks },
     laneWaitTicks: { ...state.laneWaitTicks },
     blockedRoads: { ...state.blockedRoads },
+    roadBlocks: { ...state.roadBlocks },
     spillbackEvents: [...state.spillbackEvents],
   };
   const seconds = next.tick * 0.5;
+  const reroute = (
+    vehicle: NetworkVehicle,
+    from: JunctionId,
+    destination: JunctionId,
+    currentRoadId?: string
+  ): boolean => {
+    const detour = findOpenPath(from, destination, next.roadBlocks);
+    if (!detour) return false;
+    vehicle.route = currentRoadId ? [currentRoadId, ...detour] : detour;
+    vehicle.roadIndex = 0;
+    return true;
+  };
+
+  Object.entries(next.roads).forEach(([roadId, vehicles]) => {
+    const road = ROAD_DEFINITIONS.find((item) => item.id === roadId);
+    if (!road) return;
+    vehicles.forEach((vehicle) => {
+      const destination = ROAD_DEFINITIONS.find(
+        (item) => item.id === vehicle.route[vehicle.route.length - 1]
+      )?.to;
+      const downstreamId = vehicle.route[vehicle.roadIndex + 1];
+      if (destination && downstreamId && next.roadBlocks[downstreamId]) {
+        reroute(vehicle, road.to, destination, roadId);
+      }
+    });
+  });
+
   const eligibleHeads = Object.fromEntries(
     ROAD_DEFINITIONS.map((road) => [road.id, state.roads[road.id][0]?.id])
   ) as Record<string, number | undefined>;
@@ -138,9 +188,20 @@ export const stepNetwork = (
     if (!arrivalAt(next.tick, junctionIndex)) return;
     const options = ROUTES[junction];
     const route = options[(next.tick + junctionIndex + SCENARIO_SEED) % options.length];
+    const destination = ROAD_DEFINITIONS.find((road) => road.id === route[route.length - 1])?.to;
+    const path = destination ? findOpenPath(junction, destination, next.roadBlocks) : null;
+    if (!path) {
+      next.demand[junction].push({
+        id: next.tick * 4 + junctionIndex,
+        route: [...route],
+        roadIndex: 0,
+        bornAt: seconds,
+      });
+      return;
+    }
     next.demand[junction].push({
       id: next.tick * 4 + junctionIndex,
-      route,
+      route: path,
       roadIndex: 0,
       bornAt: seconds,
     });
@@ -148,34 +209,52 @@ export const stepNetwork = (
 
   JUNCTIONS.forEach((junction) => {
     while (next.demand[junction].length > 0) {
-      const targetRoad = next.demand[junction][0].route[0];
-      if (next.roads[targetRoad].length >= ROAD_CAPACITY) break;
-      const vehicle = next.demand[junction].shift();
-      if (!vehicle) break;
-      next.roads[vehicle.route[0]].push(vehicle);
+      const vehicle = next.demand[junction][0];
+      if (vehicle.route.some((roadId) => next.roadBlocks[roadId])) {
+        const destination = ROAD_DEFINITIONS.find(
+          (road) => road.id === vehicle.route[vehicle.route.length - 1]
+        )?.to;
+        if (!destination || !reroute(vehicle, junction, destination)) break;
+      }
+      const targetRoad = vehicle.route[0];
+      if (next.roads[targetRoad].length >= ROAD_CAPACITY) {
+        spillbackObserved[targetRoad] = true;
+        break;
+      }
+      const released = next.demand[junction].shift();
+      if (!released) break;
+      next.roads[targetRoad].push(released);
     }
   });
 
-  JUNCTIONS.forEach((junction, junctionIndex) => {
+  const selectedMovements: { road: NetworkRoad; vehicle: NetworkVehicle }[] = [];
+
+  JUNCTIONS.forEach((junction) => {
     const incoming = ROAD_DEFINITIONS.filter((road) => road.to === junction);
     const phase = next.phases[junction];
     const hasVehicle = (road: NetworkRoad): boolean =>
       Boolean(next.roads[road.id][0] && next.roads[road.id][0].id === eligibleHeads[road.id]);
-    const isDownstreamAvailable = (road: NetworkRoad): boolean => {
+    const canAdvance = (road: NetworkRoad): boolean => {
       const vehicle = next.roads[road.id][0];
-      if (!vehicle) return false;
+      if (!vehicle || vehicle.id !== eligibleHeads[road.id]) return false;
       const downstreamId = vehicle.route[vehicle.roadIndex + 1];
-      return !downstreamId || next.roads[downstreamId].length < roadCapacity(downstreamId);
+      if (!downstreamId) return true;
+      if (next.roadBlocks[downstreamId]) return false;
+      const downstreamCapacity = roadCapacity(downstreamId);
+      const downstreamCount = next.roads[downstreamId].length;
+      if (downstreamCount >= downstreamCapacity) return false;
+      return mode === "independent" ||
+        downstreamCount / downstreamCapacity < COORDINATION_CAPACITY_THRESHOLD;
     };
-    const candidates = incoming.filter(
-      (road) => hasVehicle(road) && (mode === "independent" || isDownstreamAvailable(road))
+    const localCandidates = incoming.filter(
+      (road) => hasVehicle(road) && canAdvance(road)
     );
+    const coordinatedCandidates = incoming.filter((road) => hasVehicle(road) && canAdvance(road));
+    const candidates = mode === "coordinated" ? coordinatedCandidates : localCandidates;
 
     if (algorithm === "PRIORITY_AGING") {
-      const localCandidates = incoming.filter(hasVehicle);
-      const schedulerCandidates = mode === "coordinated" ? candidates : localCandidates;
-      if (schedulerCandidates.length > 0) {
-        const selected = schedulerCandidates.reduce((best, road) => {
+      if (candidates.length > 0) {
+        const selected = candidates.reduce((best, road) => {
           const score =
             next.roads[road.id].length * 10 + next.laneWaitTicks[road.id];
           const bestScore =
@@ -185,9 +264,6 @@ export const stepNetwork = (
         const selectedIndex = incoming.indexOf(selected);
         if (selectedIndex !== next.phases[junction]) next.phaseTicks[junction] = 0;
         next.phases[junction] = selectedIndex;
-      } else if (mode === "coordinated") {
-        // Preserve the active green while every downstream route is full.
-        next.phaseTicks[junction] += 1;
       }
     } else if (mode === "independent") {
       next.phaseTicks[junction] += 1;
@@ -220,18 +296,42 @@ export const stepNetwork = (
     const greenRoad = incoming[next.phases[junction] % incoming.length];
     const vehicle = next.roads[greenRoad.id][0];
     if (!vehicle || vehicle.id !== eligibleHeads[greenRoad.id]) return;
+    selectedMovements.push({ road: greenRoad, vehicle });
+  });
+
+  ROAD_DEFINITIONS.forEach((road) => {
+    const vehicle = next.roads[road.id][0];
+    const downstreamId = vehicle?.route[vehicle.roadIndex + 1];
+    if (
+    vehicle &&
+    vehicle.id === eligibleHeads[road.id] &&
+    downstreamId &&
+    next.roads[downstreamId].length >= roadCapacity(downstreamId)
+    ) {
+    spillbackObserved[road.id] = true;
+    }
+  });
+
+  selectedMovements.forEach(({ road, vehicle }) => {
     const downstreamId = vehicle.route[vehicle.roadIndex + 1];
     if (!downstreamId) {
-      next.roads[greenRoad.id].shift();
+      next.roads[road.id].shift();
       next.served += 1;
       next.travelSeconds += seconds - vehicle.bornAt;
       return;
     }
-    if (next.roads[downstreamId].length >= roadCapacity(downstreamId)) {
-      spillbackObserved[greenRoad.id] = true;
+    const downstreamCapacity = roadCapacity(downstreamId);
+    const downstreamCount = next.roads[downstreamId].length;
+    if (downstreamCount >= downstreamCapacity) {
+      spillbackObserved[road.id] = true;
       return;
     }
-    next.roads[greenRoad.id].shift();
+    if (next.roadBlocks[downstreamId]) return;
+    if (
+      mode === "coordinated" &&
+      downstreamCount / downstreamCapacity >= COORDINATION_CAPACITY_THRESHOLD
+    ) return;
+    next.roads[road.id].shift();
     vehicle.roadIndex += 1;
     next.roads[downstreamId].push(vehicle);
   });
@@ -240,7 +340,9 @@ export const stepNetwork = (
     const head = next.roads[road.id][0];
     const downstreamId = head?.route[head.roadIndex + 1];
     const blocked = spillbackObserved[road.id] || Boolean(
-      downstreamId && next.roads[downstreamId].length >= roadCapacity(downstreamId)
+      head &&
+      downstreamId &&
+      next.roads[downstreamId].length >= roadCapacity(downstreamId)
     );
     if (blocked && !state.blockedRoads[road.id]) {
       next.spillbacks += 1;
@@ -298,3 +400,46 @@ export const networkMetrics = (state: NetworkState) => ({
 export const roadDensity = (state: NetworkState, roadId: string): number =>
   (state.links[roadId]?.vehicleCount ?? state.roads[roadId]?.length ?? 0) /
   (state.links[roadId]?.capacity ?? roadCapacity(roadId));
+
+function findOpenPath(
+  start: JunctionId,
+  destination: JunctionId,
+  roadBlocks: Record<string, boolean>
+): string[] | null {
+  if (start === destination) return [];
+  const paths: { junction: JunctionId; roads: string[] }[] = [{ junction: start, roads: [] }];
+  const visited = new Set<JunctionId>([start]);
+  while (paths.length > 0) {
+    const current = paths.shift();
+    if (!current) break;
+    const outgoing = ROAD_DEFINITIONS.filter(
+      (road) => road.from === current.junction && !roadBlocks[road.id]
+    );
+    for (const road of outgoing) {
+      const roads = [...current.roads, road.id];
+      if (road.to === destination) return roads;
+      if (visited.has(road.to)) continue;
+      visited.add(road.to);
+      paths.push({ junction: road.to, roads });
+    }
+  }
+  return null;
+}
+
+export function inspectSignalSafety(state: NetworkState): SignalSafetyInspection {
+  const conflicts: string[] = [];
+  const logs = JUNCTIONS.map((junction) => {
+    const approaches = ROAD_DEFINITIONS.filter((road) => road.to === junction);
+    const phase = state.phases[junction];
+    if (!Number.isInteger(phase) || phase < 0 || phase >= approaches.length) {
+      conflicts.push(`Junction ${junction} has an invalid signal phase (${phase}).`);
+      return `Junction ${junction}: invalid phase ${phase}; inspection failed.`;
+    }
+    const active = approaches.filter((_, index) => index === phase);
+    if (active.length > 1) {
+      conflicts.push(`Junction ${junction} has conflicting green approaches.`);
+    }
+    return `Junction ${junction}: ${active.length} green approach active; 0 conflicting greens.`;
+  });
+  return { clear: conflicts.length === 0, conflicts, logs };
+}

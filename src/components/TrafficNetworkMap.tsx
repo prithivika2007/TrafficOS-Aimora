@@ -5,6 +5,7 @@ import { CircleMarker, MapContainer, Polyline, TileLayer, Tooltip, useMap } from
 import { Activity, ArrowUpRight, Clock3, Layers3, MapPin, X } from "lucide-react";
 import {
   JUNCTIONS,
+  JUNCTION_NAMES,
   ROAD_DEFINITIONS,
   ROAD_CAPACITY,
   networkMetrics,
@@ -69,18 +70,20 @@ export default function TrafficNetworkMap({
           {ROAD_DEFINITIONS.filter((road) => road.from < road.to).map((road) => {
             const reverseId = `${road.to}${road.from}`;
             const density = Math.max(roadDensity(network, road.id), roadDensity(network, reverseId));
+            const spillback = network.links[road.id].spillback || network.links[reverseId].spillback;
+            const roadBlocked = network.roadBlocks[road.id] || network.roadBlocks[reverseId];
             return (
               <Polyline
                 key={road.id}
                 positions={[LOCATIONS[road.from], LOCATIONS[road.to]]}
                 pathOptions={{
-                  color: COLORS.teal,
+                  color: roadBlocked || spillback ? COLORS.red : COLORS.teal,
                   weight: density > 0 ? 6 + Math.min(5, density * 5) : 5,
                   opacity: 0.9,
-                  className: `neon-road ${density > 0.75 ? "road-severe" : density > 0.4 ? "road-moderate" : ""}`,
+                  className: `neon-road ${roadBlocked || spillback ? "road-severe" : density > 0.75 ? "road-severe" : density > 0.4 ? "road-moderate" : ""}`,
                 }}
               >
-                <Tooltip sticky>{`${road.from} → ${road.to} · ${Math.round(density * 100)}% capacity`}</Tooltip>
+                <Tooltip sticky>{`${road.from} ↔ ${road.to} · ${Math.round(density * 100)}% capacity${roadBlocked ? " · ROADBLOCK — DETOUR ACTIVE" : spillback ? " · SPILLBACK DETECTED" : ""}`}</Tooltip>
               </Polyline>
             );
           })}
@@ -97,7 +100,7 @@ export default function TrafficNetworkMap({
               }}
               eventHandlers={{ click: () => setSelected(junction) }}
             >
-              <Tooltip direction="top" offset={[0, -9]}>{`Junction ${junction}`}</Tooltip>
+              <Tooltip direction="top" offset={[0, -9]}>{`Junction ${junction} · ${JUNCTION_NAMES[junction]}`}</Tooltip>
             </CircleMarker>
           ))}
         </MapContainer>
@@ -112,7 +115,7 @@ export default function TrafficNetworkMap({
               <X size={16} />
             </button>
             <p className="eyebrow">SIGNAL NODE · JUNCTION {selected}</p>
-            <h3>Intersection {selected}</h3>
+            <h3>{JUNCTION_NAMES[selected]}</h3>
             <div className="junction-phase"><span className="signal-dot" /> SIGNAL PHASE {network.phases[selected] % 2 + 1} ACTIVE</div>
             <div className="junction-stats">
               <div><span>Incoming queues</span><strong>{incomingQueue(network, selected)} vehicles</strong></div>

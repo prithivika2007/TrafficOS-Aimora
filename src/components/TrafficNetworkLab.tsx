@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Activity,
   Pause,
   Play,
@@ -8,6 +9,7 @@ import {
 } from "lucide-react";
 import {
   ROAD_DEFINITIONS,
+  JUNCTION_NAMES,
   networkMetrics,
   roadDensity,
   ROAD_CAPACITY,
@@ -63,7 +65,9 @@ export default function TrafficNetworkLab(): React.JSX.Element {
   const selectedState = states[mode];
   const selectedMetrics = networkMetrics(selectedState);
   const comparison: TelemetryPoint = history[history.length - 1];
-  const totalVehicles = Object.values(selectedState.roads).reduce((sum, lane) => sum + lane.length, 0);
+  const totalVehicles =
+    Object.values(selectedState.roads).reduce((sum, lane) => sum + lane.length, 0) +
+    Object.values(selectedState.demand).reduce((sum, queue) => sum + queue.length, 0);
 
   return (
     <div className="lab-page">
@@ -105,14 +109,13 @@ export default function TrafficNetworkLab(): React.JSX.Element {
             {Object.entries(selectedState.roads).flatMap(([roadId, vehicles]) =>
               vehicles.map((vehicle, index) => <i key={`${roadId}-${vehicle.id}`} className={`vehicle-particle particle-${index % 4}`} />)
             )}
-            <div className="junction-node node-a"><span>A</span><b>Junction A</b><small>{selectedState.phases.A % 2 ? "E/W GREEN" : "N/S GREEN"}</small><i className="junction-signal" /></div>
-            <div className="junction-node node-b"><span>B</span><b>Junction B</b><small>{selectedState.phases.B % 2 ? "E/W GREEN" : "N/S GREEN"}</small><i className="junction-signal" /></div>
-            <div className="junction-node node-c"><span>C</span><b>Junction C</b><small>{selectedState.phases.C % 2 ? "E/W GREEN" : "N/S GREEN"}</small><i className="junction-signal" /></div>
-            <div className="junction-node node-d"><span>D</span><b>Junction D</b><small>{selectedState.phases.D % 2 ? "E/W GREEN" : "N/S GREEN"}</small><i className="junction-signal" /></div>
-            <Road roadId="AB" state={selectedState} className="link-ab" />
-            <Road roadId="AC" state={selectedState} className="link-ac" />
-            <Road roadId="BD" state={selectedState} className="link-bd" />
-            <Road roadId="CD" state={selectedState} className="link-cd" />
+            <div className="junction-node node-a"><span>A</span><b>Junction A</b><small>{JUNCTION_NAMES.A}</small><small>PHASE {selectedState.phases.A + 1}</small><i className="junction-signal" /></div>
+            <div className="junction-node node-b"><span>B</span><b>Junction B</b><small>{JUNCTION_NAMES.B}</small><small>PHASE {selectedState.phases.B + 1}</small><i className="junction-signal" /></div>
+            <div className="junction-node node-c"><span>C</span><b>Junction C</b><small>{JUNCTION_NAMES.C}</small><small>PHASE {selectedState.phases.C + 1}</small><i className="junction-signal" /></div>
+            <div className="junction-node node-d"><span>D</span><b>Junction D</b><small>{JUNCTION_NAMES.D}</small><small>PHASE {selectedState.phases.D + 1}</small><i className="junction-signal" /></div>
+          </div>
+          <div className="network-link-grid" aria-label="Directional road link status">
+            {ROAD_DEFINITIONS.map((road) => <Road key={road.id} roadId={road.id} state={selectedState} />)}
           </div>
           <div className="network-summary"><span>{totalVehicles} vehicles in network</span><span>Capacity: {ROAD_CAPACITY} vehicles / road</span><span>{mode === "coordinated" ? "Downstream telemetry active" : "Local control only"}</span></div>
         </section>
@@ -146,15 +149,16 @@ function Metric({ label, value, suffix, change }: { label: string; value: string
   return <div className="metric-card"><span>{label}</span><strong>{value}<small>{suffix}</small></strong><em className={change <= 0 ? "positive" : "negative"}>{change > 0 ? "+" : ""}{change.toFixed(1)} vs mode</em></div>;
 }
 
-function Road({ roadId, state, className }: { roadId: string; state: NetworkState; className: string }): React.JSX.Element {
+function Road({ roadId, state }: { roadId: string; state: NetworkState }): React.JSX.Element {
   const road = ROAD_DEFINITIONS.find((item) => item.id === roadId);
   const link = state.links[roadId];
   const density = roadDensity(state, roadId);
   const status = link.spillback ? "blocked" : density >= 0.75 ? "moderate" : "clear";
   return (
-    <div className={`road-link ${className} ${status}`} aria-label={`${road?.from} to ${road?.to}, ${link.vehicleCount} of ${link.capacity} vehicles${link.spillback ? ", spillback" : ""}`}>
-      <span>{road?.from} → {road?.to}{link.spillback && <b className="spillback-label">SPILLBACK</b>}</span>
-      <i>{link.directionalQueueLength}/{link.capacity}</i>
+    <div className={`road-link ${status}`} aria-label={`${road?.from} to ${road?.to}, ${link.vehicleCount} of ${link.capacity} vehicles${link.spillback ? ", spillback detected" : ""}`}>
+      <span>{road?.from} → {road?.to}</span>
+      <i>{link.vehicleCount}/{link.capacity}</i>
+      {link.spillback && <b className="spillback-label"><AlertTriangle size={10} /> SPILLBACK DETECTED</b>}
     </div>
   );
 }
