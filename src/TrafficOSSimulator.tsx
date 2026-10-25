@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import type { MutableRefObject } from "react";
 import {
   Algo,
+  STOP_LINE,
   Direction,
   DIRECTIONS,
   MAX_PER_LANE,
@@ -16,11 +17,20 @@ import {
   step,
   addEmergencyVehicle,
   addRogueVehicle,
+  applyRoadPlan,
   checkSimulationWatchdog,
+  clearRoadIncident,
   setSimulationDataStale,
+  triggerRoadIncident,
 } from "./simEngine";
+import type { IncidentType } from "./simEngine";
 import type { EChallan } from "./eChallan";
-import { WATCHDOG_POLL_INTERVAL_MS } from "./safetyLayer";
+import {
+  STARVATION_LIMIT_SECONDS,
+  WATCHDOG_POLL_INTERVAL_MS,
+} from "./safetyLayer";
+import { addEvent, getEvents, setEventSimTime, subscribeToEvents } from "./eventStore";
+import type { EventType } from "./eventStore";
 import AmbulanceLabPanel from "./components/AmbulanceLabPanel";
 import type { AmbulanceScenario } from "./components/AmbulanceLabPanel";
 
@@ -40,10 +50,16 @@ const LANE_DOT: Record<Direction, string> = {
   WEST: "bg-amber-500 shadow-lg shadow-amber-500/50",
 };
 const LANE_COLOR: Record<Direction, string> = {
-  NORTH: "#facc15",
-  EAST: "#22d3ee",
-  SOUTH: "#f8fafc",
-  WEST: "#fbbf24",
+  NORTH: "#d9667a",
+  EAST: "#5b8def",
+  SOUTH: "#9b7be0",
+  WEST: "#e0a04a",
+};
+const LANE_WINDSHIELD: Record<Direction, string> = {
+  NORTH: "#843e50",
+  EAST: "#34528d",
+  SOUTH: "#59458d",
+  WEST: "#855a2b",
 };
 const LANE_SHORT: Record<Direction, string> = { NORTH: "N", EAST: "E", SOUTH: "S", WEST: "W" };
 const CAR_ROTATION: Record<Direction, number> = {
@@ -71,6 +87,39 @@ const isAlgo = (a?: string): a is Algo =>
 type Phase = "IDLE" | "RUNNING" | "PAUSED" | "STOPPED" | "COMPLETED";
 type DashboardTab = "SAFETY" | "E_CHALLANS";
 type BenchmarkAlgo = "STATIC" | "RR" | "PRIORITY_AGING";
+type ScenarioMode = "NORMAL" | "HEATMAP" | "ACCIDENT";
+type HeatLevel = "FREE" | "MODERATE" | "HEAVY";
+type IncidentDuration = "30" | "60" | "120" | "UNTIL_CLEARED";
+interface HeatLane {
+  score: number;
+  samples: number[];
+}
+
+const heatLevel = (score: number): HeatLevel =>
+  score < 40 ? "FREE" : score < 70 ? "MODERATE" : "HEAVY";
+const HEAT_COLORS: Record<HeatLevel, string> = {
+  FREE: "#22c55e",
+  MODERATE: "#f59e0b",
+  HEAVY: "#ef4444",
+};
+
+const HeatSparkline: React.FC<{ values: number[]; color: string }> = ({
+  values,
+  color,
+}) => {
+  const points = values
+    .map((value, index) => {
+      const x = values.length > 1 ? (index / (values.length - 1)) * 100 : 100;
+      const y = 28 - (Math.min(100, value) / 100) * 25;
+      return `${x},${y}`;
+    })
+    .join(" ");
+  return (
+    <svg viewBox="0 0 100 30" role="img" aria-label="Congestion over the last 60 simulation seconds" className="h-7 w-24">
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+};
 
 interface BenchmarkReading {
   algo: BenchmarkAlgo;
@@ -92,13 +141,14 @@ const createBenchmarkSims = (
   emergencyLane: Direction | null
 ): Partial<Record<BenchmarkAlgo, Sim>> => {
   const sims: Partial<Record<BenchmarkAlgo, Sim>> = {
-    STATIC: createSim(setup, "STATIC", emergencyLane),
+    STATIC: createSim(setup, "STATIC", emergencyLane, false),
   };
   if (activeAlgo !== "STATIC") {
     sims[activeAlgo] = createSim(
       setup,
       activeAlgo,
-      activeAlgo === "PRIORITY_AGING" ? emergencyLane : null
+      activeAlgo === "PRIORITY_AGING" ? emergencyLane : null,
+      false
     );
   }
   return sims;
@@ -117,6 +167,13 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [timeQuantum, setTimeQuantum] = useState<number>(initialAlgoConfig?.quantum || 3);
   const [aging, setAging] = useState<boolean>(true);
   const [speed, setSpeed] = useState<number>(1);
+  const [scenarioMode, setScenarioMode] = useState<ScenarioMode>("NORMAL");
+  const [incidentLane, setIncidentLane] = useState<Direction>("NORTH");
+  const [incidentType, setIncidentType] = useState<IncidentType>("ACCIDENT");
+  const [incidentDuration, setIncidentDuration] = useState<IncidentDuration>("30");
+  const [planIgnored, setPlanIgnored] = useState(false);
+  const [eventFilter, setEventFilter] = useState<EventType | "ALL">("ALL");
+  const [autoScrollEvents, setAutoScrollEvents] = useState(true);
   const [setup, setSetup] = useState<Setup>(() => presetSetup(initialAlgo));
   const [emergencyLane, setEmergencyLane] = useState<Direction | null>(null);
   const [dashboardTab, setDashboardTab] = useState<DashboardTab>("SAFETY");
@@ -135,6 +192,17 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   const [frozenBenchmark, setFrozenBenchmark] = useState<FrozenBenchmark | null>(null);
   const [reportActionError, setReportActionError] = useState<string | null>(null);
   const [reportActionNotice, setReportActionNotice] = useState<string | null>(null);
+  const [heatmap, setHeatmap] = useState<Record<Direction, HeatLane>>({
+    NORTH: { score: 0, samples: [] },
+    EAST: { score: 0, samples: [] },
+    SOUTH: { score: 0, samples: [] },
+    WEST: { score: 0, samples: [] },
+  });
+  const events = useSyncExternalStore(subscribeToEvents, getEvents, getEvents);
+  const eventScrollRef = useRef<HTMLDivElement>(null);
+  const snapRef = useRef(snap);
+  const lastHeatSampleRef = useRef(-1);
+  snapRef.current = snap;
   const benchmarkFrozenRef = useRef(false);
 
   useEffect(() => {
@@ -161,6 +229,68 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const cfgRef = useRef({ algo: selectedAlgo, quantum: timeQuantum, aging, speed });
   cfgRef.current = { algo: selectedAlgo, quantum: timeQuantum, aging, speed };
+
+  useEffect(() => {
+    if (!autoScrollEvents || !eventScrollRef.current) return;
+    eventScrollRef.current.scrollTop = eventScrollRef.current.scrollHeight;
+  }, [events, eventFilter, autoScrollEvents]);
+
+  useEffect(() => {
+    const sampleHeatmap = () => {
+      const current = snapRef.current;
+      const sampleSecond = Math.floor(current.clock);
+      const clockReset = sampleSecond < lastHeatSampleRef.current;
+      if (clockReset) lastHeatSampleRef.current = -1;
+      const elapsedSeconds = sampleSecond - lastHeatSampleRef.current;
+      if (elapsedSeconds <= 0) return;
+      lastHeatSampleRef.current = sampleSecond;
+      setHeatmap((previous) => {
+        const next = { ...previous };
+        DIRECTIONS.forEach((lane) => {
+          const queue = current.queued[lane];
+          const capacity = MAX_PER_LANE;
+          const stopped = current.cars.filter(
+            (car) => car.lane === lane && !car.released
+          ).length;
+          const queueRatio = Math.min(1, queue / capacity);
+          const raw = Math.min(
+            100,
+            queueRatio * 60 +
+              Math.min(
+                1,
+                current.avgWaitByLane[lane] / STARVATION_LIMIT_SECONDS
+              ) * 30 +
+              Math.min(1, stopped / capacity) * 10
+          );
+          const previousLane = clockReset
+            ? { score: 0, samples: [] }
+            : previous[lane];
+          let score =
+            previousLane.samples.length === 0 ? raw : previousLane.score;
+          const samples = [...previousLane.samples];
+          for (
+            let second = 0;
+            second < Math.min(elapsedSeconds, 60);
+            second++
+          ) {
+            score =
+              previousLane.samples.length === 0 && second === 0
+                ? raw
+                : score * 0.75 + raw * 0.25;
+            samples.push(score);
+          }
+          next[lane] = {
+            score,
+            samples: samples.slice(-60),
+          };
+        });
+        return next;
+      });
+    };
+    sampleHeatmap();
+    const timer = window.setInterval(sampleHeatmap, 250);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (isAlgo(initialAlgoConfig?.algo)) {
@@ -485,6 +615,12 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   };
 
   const handleAlgoChange = (algo: Algo) => {
+    setEventSimTime(simRef.current.clock);
+    addEvent({
+      type: "SCHEDULER",
+      severity: "info",
+      message: `Algorithm changed ${selectedAlgo} -> ${algo}`,
+    });
     const nextSetup = presetSetup(algo);
     setRunning(false);
     setAmbulanceScenario("IDLE");
@@ -496,6 +632,87 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
     simRef.current = createSim(nextSetup, algo);
     setSnap(snapshot(simRef.current));
     benchmarkSimsRef.current = createBenchmarkSims(nextSetup, algo, null);
+  };
+
+  const handleQuantumChange = (quantum: number) => {
+    if (quantum !== timeQuantum) {
+      setEventSimTime(simRef.current.clock);
+      addEvent({
+        type: "SCHEDULER",
+        severity: "info",
+        message: `Time quantum changed ${timeQuantum}s -> ${quantum}s`,
+      });
+    }
+    setTimeQuantum(quantum);
+  };
+
+  const triggerIncident = () => {
+    triggerRoadIncident(
+      simRef.current,
+      incidentLane,
+      incidentType,
+      incidentDuration === "UNTIL_CLEARED" ? null : Number(incidentDuration)
+    );
+    setPlanIgnored(false);
+    setSnap(snapshot(simRef.current));
+  };
+
+  const clearIncident = () => {
+    clearRoadIncident(simRef.current);
+    setPlanIgnored(true);
+    setSnap(snapshot(simRef.current));
+  };
+
+  const recommendedPlan = (): Record<Direction, number> => {
+    const blockedLane = snap.incident?.lane ?? incidentLane;
+    const available = DIRECTIONS.filter((lane) => lane !== blockedLane);
+    const sorted = [...available].sort(
+      (a, b) => heatmap[b].score - heatmap[a].score
+    );
+    const plan: Record<Direction, number> = {
+      NORTH: 0,
+      EAST: 0,
+      SOUTH: 0,
+      WEST: 0,
+    };
+    available.forEach((lane) => {
+      plan[lane] = timeQuantum;
+    });
+    const baseShare = Math.floor(timeQuantum / available.length);
+    let remainder = timeQuantum % available.length;
+    sorted.forEach((lane) => {
+      plan[lane] += baseShare + (remainder > 0 ? 1 : 0);
+      if (remainder > 0) remainder--;
+    });
+    return plan;
+  };
+
+  const applyIncidentPlan = () => {
+    applyRoadPlan(simRef.current, recommendedPlan());
+    setSnap(snapshot(simRef.current));
+  };
+
+  const exportEventsCsv = () => {
+    const escape = (value: string) => `"${value.replace(/"/g, '""')}"`;
+    const rows = [
+      ["id", "simTime", "wallTime", "type", "severity", "lane", "message"],
+      ...events.map((event) => [
+        String(event.id),
+        event.simTime,
+        event.wallTime,
+        event.type,
+        event.severity,
+        event.lane ?? "",
+        event.message,
+      ]),
+    ];
+    const csv = rows.map((row) => row.map(escape).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "trafficos-events.csv";
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   const hasAmbulance = (lane: Direction) =>
@@ -533,6 +750,23 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
   };
 
   const activeIdx = snap.active ? DIRECTIONS.indexOf(snap.active) : -1;
+  const junctionCongestion = Math.round(
+    DIRECTIONS.reduce((total, lane) => total + heatmap[lane].score, 0) /
+      DIRECTIONS.length
+  );
+  const diversionLane =
+    snap.incident === null
+      ? null
+      : DIRECTIONS.filter((lane) => lane !== snap.incident?.lane).sort(
+          (a, b) => heatmap[a].score - heatmap[b].score
+        )[0];
+  const incidentElapsed = snap.incident
+    ? Math.max(0, snap.clock - snap.incident.startedAt)
+    : 0;
+  const incidentRemaining =
+    snap.incident?.expiresAt === null || snap.incident?.expiresAt === undefined
+      ? null
+      : Math.max(0, snap.incident.expiresAt - snap.clock);
   const locked = snap.started;
   const pendingFineTotal = snap.challans
     .filter((challan) => challan.paymentStatus === "Pending")
@@ -642,6 +876,17 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
   const selectCls =
     "w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all disabled:opacity-50";
+  const visibleEvents =
+    eventFilter === "ALL"
+      ? events
+      : events.filter((event) => event.type === eventFilter);
+  const eventTypeClasses: Record<EventType, string> = {
+    SIGNAL: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+    SAFETY: "border-rose-500/30 bg-rose-500/10 text-rose-300",
+    EMERGENCY: "border-violet-500/30 bg-violet-500/10 text-violet-300",
+    ACCIDENT: "border-amber-500/30 bg-amber-500/10 text-amber-200",
+    SCHEDULER: "border-cyan-500/30 bg-cyan-500/10 text-cyan-300",
+  };
 
   return (
     <div className="font-executive space-y-6 text-slate-100 max-w-7xl mx-auto p-2">
@@ -1003,7 +1248,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
               <label className="block text-[10px] text-slate-400 mb-1.5 font-medium">TIME QUANTUM</label>
               <select
                 value={timeQuantum}
-                onChange={(e) => setTimeQuantum(Number(e.target.value))}
+                onChange={(e) => handleQuantumChange(Number(e.target.value))}
                 className={selectCls}
               >
                 {[1, 2, 3, 5].map((q) => (
@@ -1178,6 +1423,62 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             <div className="absolute h-24 w-full bg-slate-900/90 border-y border-dashed border-slate-700/50 flex items-center">
               <div className="absolute w-full h-0.5 bg-amber-400/20" />
             </div>
+            {scenarioMode === "HEATMAP" && (
+              <>
+                {DIRECTIONS.map((lane) => {
+                  const color = HEAT_COLORS[heatLevel(heatmap[lane].score)];
+                  const gradient = `linear-gradient(${
+                    lane === "NORTH" ? "to bottom" :
+                    lane === "SOUTH" ? "to top" :
+                    lane === "WEST" ? "to right" : "to left"
+                  }, ${color} 0%, ${color}00 100%)`;
+                  const position: React.CSSProperties =
+                    lane === "NORTH"
+                      ? { left: "47%", top: 0, width: "6%", height: "40%" }
+                      : lane === "SOUTH"
+                      ? { left: "47%", bottom: 0, width: "6%", height: "40%" }
+                      : lane === "WEST"
+                      ? { left: 0, top: "47%", width: "40%", height: "6%" }
+                      : { right: 0, top: "47%", width: "40%", height: "6%" };
+                  const chipPosition: React.CSSProperties =
+                    lane === "NORTH"
+                      ? { left: "50%", top: "38%", transform: "translateX(-50%)" }
+                      : lane === "SOUTH"
+                      ? { left: "50%", bottom: "38%", transform: "translateX(-50%)" }
+                      : lane === "WEST"
+                      ? { left: "35%", top: "50%", transform: "translateY(-50%)" }
+                      : { right: "35%", top: "50%", transform: "translateY(-50%)" };
+                  return (
+                    <React.Fragment key={`heat-${lane}`}>
+                      <div
+                        aria-hidden="true"
+                        className="absolute z-[1] pointer-events-none"
+                        style={{ ...position, backgroundImage: gradient, opacity: 0.3 }}
+                      />
+                      <div
+                        className="absolute z-[4] rounded-md border px-1.5 py-1 text-[8px] font-black shadow-lg"
+                        style={{
+                          ...chipPosition,
+                          borderColor: `${color}88`,
+                          backgroundColor: "rgba(2,6,23,0.9)",
+                          color,
+                        }}
+                      >
+                        {lane} · {Math.round(heatmap[lane].score)}% · {heatLevel(heatmap[lane].score)}
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+                <div className="absolute bottom-2 right-2 z-[5] flex gap-2 rounded-lg border border-slate-700 bg-slate-950/90 px-2 py-1 text-[8px] font-bold text-slate-200">
+                  {(["FREE", "MODERATE", "HEAVY"] as HeatLevel[]).map((level) => (
+                    <span key={level} className="flex items-center gap-1">
+                      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: HEAT_COLORS[level] }} />
+                      {level}
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
 
             {/* Signal Labels */}
             <div className="absolute top-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
@@ -1192,6 +1493,41 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             <div className="absolute right-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
               EAST: {signalOf("EAST")} · {snap.queued.EAST} QUEUED · {inTransitByLane.EAST} MOVING {hasAmbulance("EAST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
+
+            {scenarioMode === "ACCIDENT" && snap.incident && (
+              <>
+                <div
+                  role="status"
+                  className="absolute left-1/2 top-2 z-20 -translate-x-1/2 animate-pulse rounded-lg border border-rose-400/60 bg-rose-950/95 px-3 py-2 text-center text-[10px] font-black text-rose-100 shadow-lg sm:text-xs"
+                >
+                  ACCIDENT: {snap.incident.lane} lane blocked
+                  {incidentRemaining === null ? " · clears when manually cleared" : ` · clears in ${Math.ceil(incidentRemaining)}s`}
+                </div>
+                <div
+                  aria-label={`${snap.incident.type.replace("_", " ")} blocking ${snap.incident.lane} lane`}
+                  className={`absolute z-[5] flex h-7 w-10 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded border-2 border-amber-200 shadow-lg ${
+                    snap.incident.type === "ROAD_BLOCK"
+                      ? "bg-amber-800"
+                      : "bg-rose-800"
+                  }`}
+                  style={{
+                    ...getVehicleStyle(snap.incident.lane, STOP_LINE[snap.incident.lane]),
+                  }}
+                >
+                  {snap.incident.type === "ROAD_BLOCK" ? (
+                    <span className="h-full w-full animate-pulse bg-[repeating-linear-gradient(135deg,#fbbf24_0_5px,#713f12_5px_10px)]" />
+                  ) : (
+                    <span className="flex -rotate-12 gap-0.5">
+                      <span className="h-3 w-4 rounded-sm border border-amber-200 bg-rose-400" />
+                      {snap.incident.type === "ACCIDENT" && (
+                        <span className="mt-1 h-3 w-4 rotate-12 rounded-sm border border-amber-200 bg-slate-400" />
+                      )}
+                    </span>
+                  )}
+                  <span className="absolute -right-1 -top-1 h-2 w-2 animate-ping rounded-full bg-amber-300" />
+                </div>
+              </>
+            )}
 
             {/* Moving Vehicles */}
             {snap.cars.map((v) => (
@@ -1227,9 +1563,12 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                       stroke="#0f172a"
                       strokeWidth="1.2"
                     />
-                    <path d="M5 8h10v7H5z" fill="#f8fafc" opacity="0.9" />
+                    <path d="M5 8h10v7H5z" fill={LANE_WINDSHIELD[v.lane]} opacity="0.95" />
                     <path d="M5 18h10v3H5z" fill="#0f172a" opacity="0.8" />
-                    <path d="M7 3.5h6" stroke="#fff" strokeWidth="1.2" strokeLinecap="round" />
+                    <circle cx="5.2" cy="4.5" r="1" fill="#f8df9d" />
+                    <circle cx="14.8" cy="4.5" r="1" fill="#f8df9d" />
+                    <circle cx="5.2" cy="25.5" r="1" fill="#d66b72" />
+                    <circle cx="14.8" cy="25.5" r="1" fill="#d66b72" />
                   </svg>
                 )}
               </div>
@@ -1257,6 +1596,277 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                 </div>
               ))}
           </div>
+
+          <section className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/60 p-3.5">
+            <label htmlFor="scenario-mode" className="mb-2 block text-[10px] font-bold uppercase tracking-widest text-slate-400">
+              SCENARIO MODE
+            </label>
+            <select
+              id="scenario-mode"
+              value={scenarioMode}
+              onChange={(event) => setScenarioMode(event.target.value as ScenarioMode)}
+              className={selectCls}
+            >
+              <option value="NORMAL">Normal Traffic</option>
+              <option value="HEATMAP">Congestion Heatmap</option>
+              <option value="ACCIDENT">Accident / Road Block</option>
+            </select>
+            {scenarioMode === "HEATMAP" && (
+              <div className="mt-3 space-y-3 rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-xs font-bold text-slate-200">Junction Congestion Index</h3>
+                  <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2.5 py-1 text-xs font-black text-amber-200">
+                    {junctionCongestion}%
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[680px] text-left text-[10px]">
+                    <thead className="text-slate-500">
+                      <tr>
+                        {["Lane", "Queue", "Avg wait", "Max wait", "Passed", "Congestion %", "Level", "60s trend"].map((label) => (
+                          <th key={label} className="px-2 py-1.5 font-bold">{label}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {DIRECTIONS.map((lane) => {
+                        const score = heatmap[lane].score;
+                        const level = heatLevel(score);
+                        return (
+                          <tr key={lane} className="border-t border-slate-800 text-slate-300">
+                            <td className="px-2 py-2 font-bold">{lane}</td>
+                            <td className="px-2 py-2">{snap.queued[lane]}</td>
+                            <td className="px-2 py-2">{snap.avgWaitByLane[lane].toFixed(1)}s</td>
+                            <td className="px-2 py-2">{snap.maxWaitByLane[lane].toFixed(1)}s</td>
+                            <td className="px-2 py-2">{snap.passedByLane[lane]}</td>
+                            <td className="px-2 py-2 font-bold">{Math.round(score)}%</td>
+                            <td className="px-2 py-2">
+                              <span className="rounded-full px-2 py-1 text-[8px] font-black" style={{ color: HEAT_COLORS[level], backgroundColor: `${HEAT_COLORS[level]}20` }}>
+                                {level}
+                              </span>
+                            </td>
+                            <td className="px-2 py-1">
+                              <HeatSparkline values={heatmap[lane].samples} color={HEAT_COLORS[level]} />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {scenarioMode === "ACCIDENT" && (
+              <div className="mt-3 space-y-3 rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  <label className="text-[9px] font-bold uppercase tracking-wide text-slate-500">
+                    Lane
+                    <select
+                      value={incidentLane}
+                      onChange={(event) => setIncidentLane(event.target.value as Direction)}
+                      disabled={Boolean(snap.incident)}
+                      className={`${selectCls} mt-1`}
+                    >
+                      {DIRECTIONS.map((lane) => (
+                        <option key={lane} value={lane}>{lane[0] + lane.slice(1).toLowerCase()}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-[9px] font-bold uppercase tracking-wide text-slate-500">
+                    Type
+                    <select
+                      value={incidentType}
+                      onChange={(event) => setIncidentType(event.target.value as IncidentType)}
+                      disabled={Boolean(snap.incident)}
+                      className={`${selectCls} mt-1`}
+                    >
+                      <option value="ACCIDENT">Accident</option>
+                      <option value="ROAD_BLOCK">Road Block</option>
+                      <option value="BROKEN_DOWN">Broken-down vehicle</option>
+                    </select>
+                  </label>
+                  <label className="text-[9px] font-bold uppercase tracking-wide text-slate-500">
+                    Duration
+                    <select
+                      value={incidentDuration}
+                      onChange={(event) => setIncidentDuration(event.target.value as IncidentDuration)}
+                      disabled={Boolean(snap.incident)}
+                      className={`${selectCls} mt-1`}
+                    >
+                      <option value="30">30 seconds</option>
+                      <option value="60">60 seconds</option>
+                      <option value="120">120 seconds</option>
+                      <option value="UNTIL_CLEARED">Until cleared</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={triggerIncident}
+                    disabled={Boolean(snap.incident)}
+                    className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-[10px] font-bold text-rose-200 disabled:opacity-40"
+                  >
+                    Trigger
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearIncident}
+                    disabled={!snap.incident}
+                    className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[10px] font-bold text-amber-200 disabled:opacity-40"
+                  >
+                    Clear
+                  </button>
+                  {snap.laneQuantumPlan && (
+                    <span className="self-center text-[9px] font-bold text-emerald-300">Alternative plan active</span>
+                  )}
+                </div>
+
+                {snap.incident && !planIgnored && (
+                  <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="text-[11px] font-bold text-amber-200">Recommendation</h3>
+                      <span className="text-[9px] text-slate-400">
+                        {snap.incident.lane} affected · queue {snap.queued[snap.incident.lane]}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[10px] text-slate-300">
+                      Divert via <strong className="text-emerald-300">{diversionLane}</strong>
+                      {diversionLane && ` (${Math.round(heatmap[diversionLane].score)}% congestion)`}
+                    </p>
+                    <div className="mt-2 overflow-x-auto">
+                      <table className="w-full min-w-[360px] text-[9px]">
+                        <thead className="text-slate-500">
+                          <tr><th className="px-2 py-1 text-left">Lane</th><th className="px-2 py-1">Before</th><th className="px-2 py-1">After</th></tr>
+                        </thead>
+                        <tbody>
+                          {DIRECTIONS.map((lane) => {
+                            const plan = recommendedPlan();
+                            return (
+                              <tr key={lane} className="border-t border-slate-800 text-slate-300">
+                                <td className="px-2 py-1.5">{lane}</td>
+                                <td className="px-2 py-1.5 text-center">{timeQuantum}s</td>
+                                <td className={`px-2 py-1.5 text-center font-bold ${plan[lane] === 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                                  {plan[lane] === 0 ? "Suspended" : `${plan[lane]}s`}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="mt-2 flex gap-2">
+                      <button type="button" onClick={applyIncidentPlan} className="rounded-lg bg-amber-400 px-3 py-1.5 text-[9px] font-black text-slate-950">
+                        Apply Plan
+                      </button>
+                      <button type="button" onClick={() => setPlanIgnored(true)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-[9px] font-bold text-slate-300">
+                        Ignore
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {snap.incident && (
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { label: "ELAPSED", value: `${incidentElapsed.toFixed(1)}s` },
+                      { label: "VEHICLES STUCK", value: snap.queued[snap.incident.lane] },
+                      {
+                        label: "EXTRA AVG DELAY",
+                          value: `${Math.max(0, snap.avgWaitByLane[snap.incident.lane] - snap.incident.baselineAvgWait).toFixed(1)}s`,
+                      },
+                    ].map((metric) => (
+                      <div key={metric.label} className="rounded-lg border border-slate-800 bg-slate-950/70 p-2">
+                        <span className="block text-[8px] font-bold text-slate-500">{metric.label}</span>
+                        <span className="text-xs font-black text-slate-200">{metric.value}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="mt-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-300">
+                Live Event Log <span className="text-slate-500">({events.length}/300)</span>
+              </h3>
+              <button
+                type="button"
+                onClick={exportEventsCsv}
+                className="rounded-lg border border-slate-700 px-2.5 py-1.5 text-[9px] font-bold text-cyan-300 hover:border-cyan-400/50"
+              >
+                Export CSV
+              </button>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {(["ALL", "SIGNAL", "SAFETY", "EMERGENCY", "ACCIDENT", "SCHEDULER"] as const).map((type) => (
+                <button
+                  key={type}
+                  type="button"
+                  aria-pressed={eventFilter === type}
+                  onClick={() => setEventFilter(type)}
+                  className={`rounded-full border px-2 py-1 text-[8px] font-bold ${
+                    eventFilter === type
+                      ? "border-cyan-400/50 bg-cyan-400/10 text-cyan-200"
+                      : "border-slate-800 text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  {type === "ALL" ? "All" : type[0] + type.slice(1).toLowerCase()}
+                </button>
+              ))}
+            </div>
+            <div
+              ref={eventScrollRef}
+              onScroll={(event) => {
+                const element = event.currentTarget;
+                const nearBottom =
+                  element.scrollHeight - element.scrollTop - element.clientHeight < 24;
+                setAutoScrollEvents(nearBottom);
+              }}
+              className="mt-2 max-h-48 space-y-1.5 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/70 p-2"
+            >
+              {visibleEvents.length === 0 ? (
+                <p className="py-3 text-center text-[10px] text-slate-500">No matching events yet.</p>
+              ) : (
+                visibleEvents.map((event) => (
+                  <div
+                    key={event.id}
+                    className={`grid grid-cols-[auto_auto_1fr] items-start gap-2 border-l-2 px-2 py-1.5 text-[9px] ${
+                      event.severity === "critical"
+                        ? "border-l-rose-500 bg-rose-500/5"
+                        : event.severity === "warn"
+                        ? "border-l-amber-400 bg-amber-400/5"
+                        : "border-l-slate-700"
+                    }`}
+                  >
+                    <span className="font-mono text-slate-500">{event.simTime} · {event.wallTime}</span>
+                    <span className={`rounded border px-1.5 py-0.5 font-black ${eventTypeClasses[event.type]}`}>
+                      {event.type}
+                    </span>
+                    <span className={event.severity === "critical" ? "font-semibold text-rose-200" : event.severity === "warn" ? "text-amber-200" : "text-slate-300"}>
+                      {event.lane ? `${event.lane} · ` : ""}{event.message}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+            {!autoScrollEvents && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAutoScrollEvents(true);
+                  if (eventScrollRef.current) {
+                    eventScrollRef.current.scrollTop = eventScrollRef.current.scrollHeight;
+                  }
+                }}
+                className="mt-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1.5 text-[9px] font-bold text-cyan-200"
+              >
+                Jump to latest
+              </button>
+            )}
+          </section>
 
           {/* Circular Queue Traversal Grid */}
           <div className="mt-4 p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800">

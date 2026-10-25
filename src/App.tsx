@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useSyncExternalStore } from "react";
 import TrafficOSSimulator from "./TrafficOSSimulator";
 import LiveTrafficConsole from "./components/LiveTrafficConsole";
 import QueueAnalytics from "./components/QueueAnalytics";
 import { createSim, defaultSetup } from "./simEngine";
 import type { Sim } from "./simEngine";
+import { getEvents, subscribeToEvents } from "./eventStore";
 
 type TabId = "landing" | "simulator" | "console" | "analytics" | "logs";
 
@@ -14,6 +15,7 @@ interface NavTab {
 }
 
 export default function App(): React.JSX.Element {
+  const events = useSyncExternalStore(subscribeToEvents, getEvents, getEvents);
   const [activeTab, setActiveTab] = useState<TabId>("landing");
   const [time, setTime] = useState<string>(new Date().toLocaleTimeString());
   const [cpuUsage, setCpuUsage] = useState<number>(14);
@@ -222,12 +224,33 @@ export default function App(): React.JSX.Element {
           <div className="p-6 bg-[#080a0f] border border-slate-800/80 rounded-3xl font-mono text-xs text-slate-300 space-y-2.5 shadow-2xl">
             <div className="text-amber-300 font-bold border-b border-slate-800 pb-3 flex items-center justify-between">
               <span>[KERNEL LOG SYSTEM — LIVE TRACE]</span>
-              <span className="text-[10px] text-slate-500">BUFFER SIZE: 4.2 KB</span>
+              <span className="text-[10px] text-slate-500">EVENT BUFFER: {events.length}/300</span>
             </div>
             <div className="text-slate-400">[08:42:01] INFO: Initialized Intersection Node #01 [SRM_AIML_CLUSTER]</div>
             <div className="text-cyan-300">[08:42:02] KERNEL: Active Algorithm set to Round-Robin (Time Quantum: 3s)</div>
             <div className="text-emerald-300">[08:42:05] SCHEDULER: Switched priority signal to NORTH lane (Weight: 1.0)</div>
             <div className="text-amber-350">[08:42:08] AGING_ENGINE: Evaluated starvation weights. Delta waiting threshold normal.</div>
+            <div className="my-3 border-t border-slate-800" />
+            {simulationRef.current.logs.slice(-30).reverse().map((message, index) => (
+              <div key={`kernel-${index}`} className="text-slate-400">
+                [SIM {simulationRef.current.clock.toFixed(1)}s] {message}
+              </div>
+            ))}
+            {events.map((event) => (
+              <div
+                key={event.id}
+                className={
+                  event.severity === "critical"
+                    ? "text-rose-300"
+                    : event.severity === "warn"
+                    ? "text-amber-200"
+                    : "text-slate-300"
+                }
+              >
+                [{event.wallTime} · t={event.simTime}] {event.type}
+                {event.lane ? `/${event.lane}` : ""}: {event.message}
+              </div>
+            ))}
           </div>
         )}
       </main>
