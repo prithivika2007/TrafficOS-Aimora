@@ -173,6 +173,7 @@ body {
 }
 
 button { font: inherit; }
+select option { background-color: #0f172a; color: #f1f5f9; font-weight: 600; }
 
 .app-frame { display: flex; min-height: 100vh; background: var(--app-bg); }
 .sidebar { width: 254px; flex: 0 0 254px; display: flex; flex-direction: column; background: var(--sidebar-bg); border-right: 1px solid #1b2432; padding: 22px 14px 14px; }
@@ -536,7 +537,7 @@ body {
 .network-selector b,.system-health b,.profile b { color: #f1f5f9; font-size: 13px; }
 .network-selector small,.system-health small,.profile small { color: #b4c0cf; font-size: 11px; }
 .breadcrumbs { color: #b4c0cf; font-size: 13px; }
-.welcome-heading p:not(.eyebrow),.page-heading p:not(.eyebrow) { color: #cbd5e1; font-size: 13px; }
+.welcome-heading p:not(.eyebrow),.page-heading p:not(.eyebrow) { color: #cbd5e1; font-size: 14px; font-weight: 500; }
 .eyebrow { color: #8ce9dc; font-size: 11px; }
 .panel-heading h2,.map-toolbar h2 { color: #f1f5f9; font-size: 18px; font-weight: 700; }
 .overview-metric-label,.overview-metric strong small,.metric-trend { color: #cbd5e1; font-size: 12px; font-weight: 500; }

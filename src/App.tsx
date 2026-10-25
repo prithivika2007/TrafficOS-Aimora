@@ -180,8 +180,8 @@ function DashboardShell(): React.JSX.Element {
           {activePage === "map" && <TrafficNetworkMap onOpenLab={() => navigate("network")} scenario={mapScenario} />}
           {(activePage === "scheduler" || activePage === "emergency") && (
             <div className="legacy-lab-wrap">
-              <div className="page-heading"><div><p className="eyebrow">{activePage === "emergency" ? "EMERGENCY RESPONSE · ISR PREEMPTION" : "SINGLE INTERSECTION · ALGORITHM EVALUATION"}</p><h1>{PAGE_TITLES[activePage]}</h1><p>{activePage === "emergency" ? "Test ambulance detection, safe signal preemption, and scheduler recovery." : "Evaluate Round Robin, static timers, and priority aging at a single junction."}</p></div></div>
-              {activePage === "scheduler" ? <SchedulerVisual /> : <EmergencyRouteVisual />}
+              <div className="page-heading"><div><p className="eyebrow">{activePage === "emergency" ? "EMERGENCY RESPONSE · ISR PREEMPTION" : "SINGLE INTERSECTION · ALGORITHM EVALUATION"}</p><h1>{PAGE_TITLES[activePage]}</h1><p className={activePage === "scheduler" ? "text-sm font-medium text-slate-300" : ""}>{activePage === "emergency" ? "Test ambulance detection, safe signal preemption, and scheduler recovery." : "Evaluate Round Robin, static timers, and priority aging at a single junction."}</p></div></div>
+              {activePage === "emergency" && <EmergencyRouteVisual />}
               <TrafficOSSimulator simulationRef={simulationRef} simulationRevision={simulationRevision} />
               <div className="sim-disclaimer">SIMULATION MODEL — SYNTHETIC TRAFFIC DATA FOR ALGORITHMIC BENCHMARKING</div>
             </div>
@@ -275,36 +275,6 @@ function EventTicker(): React.JSX.Element {
     </div>
     <span className="ticker-state">{running ? "STREAMING" : "FROZEN"}</span>
   </div>;
-}
-
-function SchedulerVisual(): React.JSX.Element {
-  const { states, mode, running, events } = useTraffic();
-  const state = states[mode];
-  const emergencySpawnId = events.find((event) => event.kind === "preemption")?.id ?? null;
-  const approachCounts = [
-    state.demand.A.length,
-    state.demand.B.length,
-    state.demand.C.length,
-    state.demand.D.length,
-  ];
-  return <section className="panel scheduler-visual">
-    <div className="panel-heading"><div><p className="eyebrow">SINGLE JUNCTION · LIVE SIGNAL STATE</p><h2>Intersection control surface</h2></div><span className={`simulation-badge ${running ? "pulse-badge" : ""}`}>{mode.toUpperCase()} · T+{(state.tick * 0.5).toFixed(1)}s</span></div>
-    <div className="scheduler-canvas">
-      <SchedulerTrafficCanvas phase={state.phases.A} phaseTicks={state.phaseTicks.A} allRed={state.signalSafety.A.mode === "ALL_RED"} approachCounts={approachCounts} emergencySpawnId={emergencySpawnId} />
-      <div className="scheduler-overlay"><span className="signal-dot" />{state.signalSafety.A.mode === "ALL_RED" ? "ALL-RED FAIL-SAFE" : `${(["NORTH", "EAST", "SOUTH", "WEST"] as const)[state.phases.A % 4]} APPROACH GREEN`}<small>{JUNCTIONS.reduce((sum, node) => sum + state.demand[node].length, 0)} queued vehicles · shared simulation</small></div>
-    </div>
-    <div className="approach-status-grid">
-      {(["NORTH", "EAST", "SOUTH", "WEST"] as const).map((direction, index) => {
-        const activePhase = state.phases.A % 4 === index;
-        const signal = state.signalSafety.A.mode === "ALL_RED"
-          ? "ALL RED"
-          : activePhase ? state.phaseTicks.A % 6 >= 4 ? "AMBER" : "GREEN" : "RED";
-        return <div key={direction} className={`approach-status approach-${direction.toLowerCase()}`}>
-          <i /> <b>{direction}</b><span>{approachCounts[index]} queued</span><strong>{signal}</strong>
-        </div>;
-      })}
-    </div>
-  </section>;
 }
 
 interface CanvasVehicle {

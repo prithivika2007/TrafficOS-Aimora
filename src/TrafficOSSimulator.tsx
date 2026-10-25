@@ -1367,7 +1367,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
       : "border-rose-300 bg-rose-500/10 text-rose-700";
 
   const selectCls =
-    "w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all disabled:opacity-50";
+    "w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs font-semibold text-slate-100 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all disabled:opacity-50";
   const visibleEvents =
     eventFilter === "ALL"
       ? events
@@ -1388,10 +1388,10 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
           <button
             onClick={startPause}
             disabled={phase === "IDLE" && totalVehicles === 0}
-            className={`px-5 py-2.5 rounded-xl font-bold text-xs tracking-wider transition-all shadow-lg disabled:opacity-40 flex items-center gap-2 ${
+            className={`px-5 py-2.5 rounded-xl font-bold text-xs tracking-wider uppercase text-white transition-all shadow-lg disabled:opacity-40 flex items-center gap-2 ${
               phase === "RUNNING"
-                ? "bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-amber-500/20"
-                : "bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-950 shadow-emerald-500/20"
+                ? "bg-amber-500 hover:bg-amber-400 shadow-amber-500/20"
+                : "bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 shadow-emerald-500/20"
             }`}
           >
             {phase === "RUNNING" && <span className="w-2 h-2 rounded-full bg-slate-950 animate-ping" />}
@@ -1408,7 +1408,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             type="button"
             onClick={stopKernel}
             disabled={phase !== "RUNNING"}
-            className="px-4 py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-xs font-bold text-rose-300 border border-rose-500/30 transition-all disabled:opacity-40"
+            className="px-4 py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-xs font-bold tracking-wider uppercase text-white border border-rose-500/30 transition-all disabled:opacity-40"
           >
             STOP KERNEL
           </button>
@@ -1416,14 +1416,14 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
           <button
             onClick={stepTick}
             disabled={phase === "RUNNING" || phase === "COMPLETED" || phase === "STOPPED" || totalVehicles === 0}
-            className="px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 text-xs font-bold text-cyan-300 border border-cyan-500/30 transition-all disabled:opacity-40"
+            className="px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 text-xs font-bold tracking-wider uppercase text-white border border-cyan-500/30 transition-all disabled:opacity-40"
           >
             STEP TICK
           </button>
 
           <button
             onClick={reset}
-            className="px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 text-xs font-semibold text-slate-300 border border-slate-700 transition-all hover:border-slate-500"
+            className="px-4 py-2.5 rounded-xl bg-slate-800/80 hover:bg-slate-750 text-xs font-bold tracking-wider uppercase text-white border border-slate-700 transition-all hover:border-slate-500"
           >
             RESET
           </button>
@@ -1711,14 +1711,14 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
         {/* Left Control Panel */}
         <div className="lg:col-span-4 p-5 rounded-2xl bg-slate-900/90 backdrop-blur-xl border border-slate-800 space-y-5 shadow-xl">
           <div className="flex items-center justify-between">
-            <h3 className="text-xs font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
+            <h3 className="text-base font-bold tracking-wider text-cyan-400 uppercase flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
               Scheduler Parameters
             </h3>
           </div>
 
           <div>
-            <label className="block text-[11px] text-slate-400 mb-1.5 font-medium">Active Algorithm</label>
+            <label className="block text-xs font-bold text-slate-200 uppercase tracking-wide mb-1.5">Active Algorithm</label>
             <select
               value={selectedAlgo}
               onChange={(e) => handleAlgoChange(e.target.value as Algo)}
@@ -1730,14 +1730,14 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
                 </option>
               ))}
             </select>
-            <p className="mt-2 text-[10px] leading-relaxed text-slate-400 bg-slate-950/40 p-2.5 rounded-xl border border-slate-800/60">
+            <p className="mt-2 text-xs font-medium text-slate-300 leading-relaxed bg-slate-950/40 p-2.5 rounded-xl border border-slate-800/60">
               {ALGO_HINT[selectedAlgo]}
             </p>
           </div>
 
           <div className="grid grid-cols-2 gap-3 text-xs">
             <div>
-              <label className="block text-[10px] text-slate-400 mb-1.5 font-medium">TIME QUANTUM</label>
+              <label className="block text-xs font-bold text-slate-200 uppercase tracking-wide mb-1.5">TIME QUANTUM</label>
               <select
                 value={timeQuantum}
                 onChange={(e) => handleQuantumChange(Number(e.target.value))}
@@ -1751,7 +1751,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
               </select>
             </div>
             <div>
-              <label className="block text-[10px] text-slate-400 mb-1.5 font-medium">SIM SPEED</label>
+              <label className="block text-xs font-bold text-slate-200 uppercase tracking-wide mb-1.5">SIM SPEED</label>
               <select
                 value={speed}
                 onChange={(e) => setSpeed(Number(e.target.value))}
@@ -1782,10 +1782,10 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
           {/* Lane Workload Config */}
           <div className="space-y-2.5 pt-2 border-t border-slate-800/80">
-            <label className="block text-[10px] text-slate-400 uppercase font-semibold tracking-wider">
+            <label className="block text-base font-bold tracking-wider text-cyan-400 uppercase">
               Lane Workload {locked && "(Locked — Reset to edit)"}
             </label>
-            <div className="grid grid-cols-[1.2fr_1fr_1fr] gap-2 text-[10px] text-slate-500 px-1 font-semibold">
+            <div className="grid grid-cols-[1.2fr_1fr_1fr] gap-2 text-xs font-bold text-slate-200 uppercase tracking-wide px-1">
               <span>LANE</span>
               <span>VEHICLES</span>
               <span className={selectedAlgo === "PRIORITY_AGING" ? "" : "opacity-30"}>PRIORITY</span>
@@ -1850,7 +1850,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
           {/* Live Injection Actions */}
           <div className="pt-2 border-t border-slate-800/80">
-            <label className="block text-[10px] text-slate-400 mb-2 uppercase font-semibold tracking-wider">
+            <label className="block text-base font-bold tracking-wider text-cyan-400 uppercase mb-2">
               Live Injection Controls
             </label>
             <div className={`grid ${selectedAlgo === "PRIORITY_AGING" ? "grid-cols-5" : "grid-cols-4"} gap-2`}>
@@ -1921,16 +1921,16 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
             )}
 
             {/* Signal Labels */}
-            <div className="absolute top-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
+            <div className="absolute top-3 left-4 z-10 rounded-md border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-xs font-bold tracking-wide text-white shadow-lg">
               NORTH: {signalOf("NORTH")} · {queuedByLane.NORTH} QUEUED · {inTransitByLane.NORTH} MOVING {hasAmbulance("NORTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
-            <div className="absolute bottom-3 left-4 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2.5 py-1.5 text-[10px] font-bold tracking-wide text-white shadow-lg sm:text-[11px]">
+            <div className="absolute bottom-3 left-4 z-10 rounded-md border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-xs font-bold tracking-wide text-white shadow-lg">
               SOUTH: {signalOf("SOUTH")} · {queuedByLane.SOUTH} QUEUED · {inTransitByLane.SOUTH} MOVING {hasAmbulance("SOUTH") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
-            <div className="absolute left-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
+            <div className="absolute left-3 top-16 z-10 rounded-md border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-xs font-bold tracking-wide text-white shadow-lg">
               WEST: {signalOf("WEST")} · {queuedByLane.WEST} QUEUED · {inTransitByLane.WEST} MOVING {hasAmbulance("WEST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
-            <div className="absolute right-3 top-16 z-10 rounded-lg border border-slate-700 bg-slate-950/95 px-2 py-1.5 text-[9px] font-bold tracking-wide text-white shadow-lg sm:text-[10px]">
+            <div className="absolute right-3 top-16 z-10 rounded-md border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-xs font-bold tracking-wide text-white shadow-lg">
               EAST: {signalOf("EAST")} · {queuedByLane.EAST} QUEUED · {inTransitByLane.EAST} MOVING {hasAmbulance("EAST") && <span className="text-rose-300 animate-pulse font-extrabold">🚨</span>}
             </div>
 
@@ -1948,7 +1948,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
           </div>
 
           <section className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/60 p-3.5">
-            <label htmlFor="scenario-mode" className="mb-2 block text-[10px] font-bold uppercase tracking-widest text-slate-400">
+            <label htmlFor="scenario-mode" className="mb-2 block text-base font-bold tracking-wider text-cyan-400 uppercase">
               SCENARIO MODE
             </label>
             <select
@@ -2139,7 +2139,7 @@ export const TrafficOSSimulator: React.FC<TrafficOSSimulatorProps> = ({
 
           <section className="mt-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-300">
+              <h3 className="text-base font-bold tracking-wider text-cyan-400 uppercase">
                 Live Event Log <span className="text-slate-500">({events.length}/300)</span>
               </h3>
               <button
