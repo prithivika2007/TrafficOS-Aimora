@@ -22,6 +22,7 @@ export interface NetworkLinkState {
   vehicleCount: number;
   directionalQueueLength: number;
   queueLength: number;
+  blocked: boolean;
   spillback: boolean;
 }
 
@@ -36,6 +37,8 @@ export interface SignalSafetyState {
   pendingPhase: number | null;
   clearanceTicks: number;
   violationAuditCount: number;
+  violationActive: boolean;
+  failSafeUntil: number | null;
 }
 
 export type NetworkAlgorithm = "ROUND_ROBIN" | "PRIORITY_AGING";
@@ -64,10 +67,10 @@ export const SCENARIO_SEED = 2026;
 export const MAX_CAPACITY = 12;
 export const ROAD_CAPACITY = MAX_CAPACITY;
 export const JUNCTION_NAMES: Record<JunctionId, string> = {
-  A: "Market & 8th",
-  B: "Mission & 5th",
-  C: "Mission & 8th",
-  D: "Market & 5th",
+  A: "Gemini Flyover",
+  B: "Teynampet",
+  C: "Nandanam",
+  D: "Saidapet",
 };
 const COORDINATION_CAPACITY_THRESHOLD = 0.75;
 export const AMBER_CLEARANCE_SECONDS = 2;
@@ -106,6 +109,7 @@ export const createNetworkState = (): NetworkState => ({
         vehicleCount: 0,
         directionalQueueLength: 0,
         queueLength: 0,
+        blocked: false,
         spillback: false,
       },
     ])
@@ -119,7 +123,14 @@ export const createNetworkState = (): NetworkState => ({
   signalSafety: Object.fromEntries(
     JUNCTIONS.map((junction) => [
       junction,
-      { mode: "GREEN", pendingPhase: null, clearanceTicks: 0, violationAuditCount: 0 },
+      {
+        mode: "GREEN",
+        pendingPhase: null,
+        clearanceTicks: 0,
+        violationAuditCount: 0,
+        violationActive: false,
+        failSafeUntil: null,
+      },
     ])
   ) as Record<JunctionId, SignalSafetyState>,
   spillbackEvents: [],
@@ -252,13 +263,28 @@ export const stepNetwork = (
     const incoming = ROAD_DEFINITIONS.filter((road) => road.to === junction);
     const safety = next.signalSafety[junction];
     if (safety.mode === "ALL_RED") {
-      safety.clearanceTicks = Math.max(0, safety.clearanceTicks - 1);
-      if (safety.clearanceTicks === 0 && safety.pendingPhase !== null) {
-        next.phases[junction] = safety.pendingPhase;
-        safety.pendingPhase = null;
-        safety.mode = "GREEN";
+      if (safety.failSafeUntil !== null) {
+        const remainingMs = safety.failSafeUntil - Date.now();
+        if (remainingMs <= 0 && safety.pendingPhase !== null) {
+          next.phases[junction] = safety.pendingPhase;
+          safety.pendingPhase = null;
+          safety.mode = "GREEN";
+          safety.violationActive = false;
+          safety.failSafeUntil = null;
+          safety.clearanceTicks = 0;
+        } else {
+          safety.clearanceTicks = Math.ceil(remainingMs / 500);
+          return;
+        }
+      } else {
+        safety.clearanceTicks = Math.max(0, safety.clearanceTicks - 1);
+        if (safety.clearanceTicks === 0 && safety.pendingPhase !== null) {
+          next.phases[junction] = safety.pendingPhase;
+          safety.pendingPhase = null;
+          safety.mode = "GREEN";
+        }
+        return;
       }
-      return;
     }
     const previousPhase = next.phases[junction];
     const phase = next.phases[junction];
@@ -328,6 +354,7 @@ export const stepNetwork = (
       safety.mode = "ALL_RED";
       safety.pendingPhase = selectedPhase;
       safety.clearanceTicks = AMBER_CLEARANCE_TICKS;
+      safety.failSafeUntil = null;
       next.phases[junction] = previousPhase;
       return;
     }
@@ -400,6 +427,7 @@ export const stepNetwork = (
       queueLength:
         next.roads[road.id].length +
         next.demand[road.from].filter((vehicle) => vehicle.route[0] === road.id).length,
+      blocked: next.roadBlocks[road.id],
       spillback: blocked,
     };
     if (next.roads[road.id].length > 0) {
@@ -471,14 +499,17 @@ export function inspectSignalSafety(state: NetworkState): SignalSafetyInspection
     const approaches = ROAD_DEFINITIONS.filter((road) => road.to === junction);
     const phase = state.phases[junction];
     const safety = state.signalSafety[junction];
+    if (safety.violationActive) {
+      conflicts.push(`${JUNCTION_NAMES[junction]}: illegal conflicting-green request intercepted; fail-safe clearance active.`);
+    }
     if (!Number.isInteger(phase) || phase < 0 || phase >= approaches.length) {
-      conflicts.push(`Junction ${junction} has an invalid signal phase (${phase}).`);
-      return `Junction ${junction}: invalid phase ${phase}; inspection failed.`;
+      conflicts.push(`${JUNCTION_NAMES[junction]} has an invalid signal phase (${phase}).`);
+      return `${JUNCTION_NAMES[junction]}: invalid phase ${phase}; inspection failed.`;
     }
     if (safety.mode === "ALL_RED") {
-      return `Junction ${junction}: ALL-RED fail-safe; ${safety.clearanceTicks * 0.5}s clearance remaining.`;
+      return `${JUNCTION_NAMES[junction]}: ALL-RED fail-safe; ${safety.clearanceTicks * 0.5}s clearance remaining.`;
     }
-    return `Junction ${junction}: ${signalAxis(approaches[phase])} green; opposing approaches held red.`;
+    return `${JUNCTION_NAMES[junction]}: ${signalAxis(approaches[phase])} green; opposing approaches held red.`;
   });
   return { clear: conflicts.length === 0, conflicts, logs };
 }
@@ -500,8 +531,45 @@ export function triggerSafetyFailSafe(
     pendingPhase: state.phases[junction],
     clearanceTicks: AMBER_CLEARANCE_TICKS,
     violationAuditCount: state.signalSafety[junction].violationAuditCount + 1,
+    violationActive: true,
+    failSafeUntil: Date.now() + AMBER_CLEARANCE_SECONDS * 1000,
   };
   return next;
+}
+
+export function completeExpiredSafetyFailSafes(
+  state: NetworkState,
+  now = Date.now()
+): NetworkState {
+  let updated: NetworkState | null = null;
+  JUNCTIONS.forEach((junction) => {
+    const safety = state.signalSafety[junction];
+    if (safety.mode !== "ALL_RED" || safety.failSafeUntil === null) return;
+    const remainingMs = safety.failSafeUntil - now;
+    const result = updated ?? {
+      ...state,
+      phases: { ...state.phases },
+      signalSafety: { ...state.signalSafety },
+    };
+    updated = result;
+    if (remainingMs > 0) {
+      result.signalSafety[junction] = {
+        ...safety,
+        clearanceTicks: Math.ceil(remainingMs / 500),
+      };
+      return;
+    }
+    if (safety.pendingPhase !== null) result.phases[junction] = safety.pendingPhase;
+    result.signalSafety[junction] = {
+      ...safety,
+      mode: "GREEN",
+      pendingPhase: null,
+      clearanceTicks: 0,
+      violationActive: false,
+      failSafeUntil: null,
+    };
+  });
+  return updated ?? state;
 }
 
 function signalAxis(road: NetworkRoad): "NORTH-SOUTH" | "EAST-WEST" {

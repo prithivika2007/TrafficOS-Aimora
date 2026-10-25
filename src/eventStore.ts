@@ -9,6 +9,7 @@ export type EventSeverity = "info" | "warn" | "critical";
 export interface TrafficEvent {
   id: number;
   simTime: string;
+  simulationSeconds: number;
   wallTime: string;
   type: EventType;
   severity: EventSeverity;
@@ -16,7 +17,10 @@ export interface TrafficEvent {
   message: string;
 }
 
-export type EventInput = Omit<TrafficEvent, "id" | "simTime" | "wallTime">;
+export type EventInput = Omit<
+  TrafficEvent,
+  "id" | "simTime" | "simulationSeconds" | "wallTime"
+> & { simulationSeconds?: number };
 
 const MAX_EVENTS = 300;
 let events: TrafficEvent[] = [];
@@ -40,6 +44,7 @@ export const addEvent = (input: EventInput): TrafficEvent => {
     ...input,
     id: nextId++,
     simTime: formatSimTime(simulationTime),
+    simulationSeconds: input.simulationSeconds ?? simulationTime,
     wallTime: new Date().toLocaleTimeString("en-GB", {
       hour12: false,
     }),
@@ -50,6 +55,13 @@ export const addEvent = (input: EventInput): TrafficEvent => {
 };
 
 export const getEvents = () => events;
+
+export const clearEvents = () => {
+  if (events.length === 0) return;
+  events = [];
+  nextId = 1;
+  listeners.forEach((listener) => listener());
+};
 
 export const subscribeToEvents = (listener: () => void) => {
   listeners.add(listener);

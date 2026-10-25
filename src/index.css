@@ -187,6 +187,9 @@ button { font: inherit; }
 .network-selector b { font-size: 11px; font-weight: 700; }
 .network-selector small { margin-top: 4px; color: #8994a5; font-size: 9px; }
 .network-selector > svg { color: #7f8a9b; }
+.corridor-location-badge { display: flex; flex-direction: column; gap: 5px; padding: 11px 14px; margin: 0 0 12px; border: 1px solid #00f3ff55; border-radius: 9px; background: linear-gradient(100deg, #00f3ff12, #ff005508); box-shadow: inset 0 0 18px #00f3ff0a, 0 0 16px #00f3ff0b; }
+.corridor-location-badge strong { color: #c5fbff; font-size: 10px; font-weight: 800; letter-spacing: .45px; line-height: 1.6; }
+.corridor-location-badge span { color: #77b9c2; font-size: 9px; font-weight: 700; letter-spacing: .35px; }
 .sidebar-nav { flex: 1; }
 .sidebar-group { margin: 0 0 22px; }
 .sidebar-group-label { display: block; padding: 0 11px; margin: 0 0 9px; color: #596578; font-size: 9px; font-weight: 800; letter-spacing: 1.1px; }
@@ -421,9 +424,10 @@ body {
 .sync-status:not(.is-running) i { background: #8190a2; box-shadow: none; }.sync-status.is-running { color: #53d5c3; }
 .sim-disclaimer { color: #c2d6e6; border-color: #254b5b; background: linear-gradient(90deg,#06b6d410,#14b8a60b); }
 .map-view,.incident-map-view { background: #08111b; }
-.neon-road { filter: drop-shadow(0 0 5px #00f3ff) drop-shadow(0 0 12px #00f3ffb3); }
-.neon-road.road-moderate { filter: drop-shadow(0 0 6px #ffe600) drop-shadow(0 0 14px #ffe600b3); }
-.neon-road.road-severe { filter: drop-shadow(0 0 6px #ff0055) drop-shadow(0 0 15px #ff0055cc); }
+.neon-road { filter: drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.6)); }
+.neon-road.road-moderate { filter: drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.6)) drop-shadow(0 0 4px #DC2626aa); }
+.neon-road.road-severe { filter: drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.6)) drop-shadow(0 0 6px #EF4444cc); }
+.neon-road.road-detour { filter: drop-shadow(0px 2px 4px rgba(0, 0, 0, 0.6)) drop-shadow(0 0 5px #991B1B); }
 .neon-road.road-flow { stroke-dasharray: 12 10; animation: neon-road-flow 1.25s linear infinite; }
 .neon-road.road-warning { animation-duration: .8s; }
 .neon-node { filter: drop-shadow(0 0 5px currentColor) drop-shadow(0 0 12px currentColor); }
@@ -481,9 +485,9 @@ body {
 .analytics-chart-canvas { width: 100%; height: 245px; margin-top: 10px; }.analytics-summary { display: flex; align-items: center; gap: 13px; padding: 14px; margin-top: 12px; }.summary-icon { display: grid; place-items: center; width: 34px; height: 34px; color: #5eead4; border-radius: 9px; background: #14b8a61a; }.analytics-summary p:last-child { margin: 6px 0 0; color: #b1bdca; font-size: 10px; line-height: 1.6; }
 .network-diagram { background-image: linear-gradient(rgba(28,47,65,.1) 1px,transparent 1px),linear-gradient(90deg,rgba(28,47,65,.1) 1px,transparent 1px),radial-gradient(ellipse at center,#172431 0,#0d1520 78%); background-size: 26px 26px,26px 26px,auto; }
 .network-diagram:before,.network-diagram:after { opacity: .6; }
-.network-road { position: absolute; z-index: 1; background: #06b6d4; opacity: .55; box-shadow: 0 0 8px #06b6d4; }.horizontal-road { top: 29%; left: 22%; width: 56%; height: 2px; }.vertical-road { top: 24%; left: 28%; width: 2px; height: 52%; }.diagonal-road { top: 49%; left: 28%; width: 44%; height: 2px; transform: rotate(-20deg); opacity: .22; }
+.network-road { position: absolute; z-index: 1; background: #DC2626; opacity: .9; box-shadow: 0 2px 4px #0009, 0 0 5px #991B1B99; }.horizontal-road { top: 29%; left: 22%; width: 56%; height: 6px; }.vertical-road { top: 24%; left: 28%; width: 6px; height: 52%; }.diagonal-road { top: 49%; left: 28%; width: 44%; height: 6px; transform: rotate(-20deg); opacity: .9; }
 .junction-signal { position: absolute; top: 9px; right: 8px; width: 6px; height: 6px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 7px #22c55e; }.junction-node:nth-of-type(2) .junction-signal { background: #ef4444; box-shadow: 0 0 7px #ef4444; }
-.vehicle-particle { position: absolute; z-index: 4; top: 28%; left: 25%; width: 6px; height: 4px; border-radius: 2px; background: #a5f3fc; box-shadow: 0 0 8px #06b6d4; animation: vehicle-traverse 3s linear infinite; }.particle-1 { animation-delay: -.7s; }.particle-2 { animation-delay: -1.5s; }.particle-3 { animation-delay: -2.2s; }
+.vehicle-particle { position: absolute; z-index: 4; top: 28%; left: 25%; width: 6px; height: 4px; border: 1px solid #fff; border-radius: 2px; background: #EF4444; box-shadow: 0 0 5px #000, 0 0 8px #EF4444; animation: vehicle-traverse 3s linear infinite; }.particle-1 { animation-delay: -.7s; }.particle-2 { animation-delay: -1.5s; }.particle-3 { animation-delay: -2.2s; }
 @keyframes vehicle-traverse { 0% { transform: translate(0,0); opacity: 0; } 12% { opacity: 1; } 88% { opacity: 1; } 100% { transform: translate(300px,75px); opacity: 0; } }
 .road-link.blocked { color: #ffb5b5; background: #421b24; animation: pulse-subtle 1s ease-in-out infinite; }
 .mode-button.selected { box-shadow: 0 0 14px #14b8a622; }
@@ -525,4 +529,66 @@ body {
 @media (max-width: 520px) {
   .isr-stages { gap: 4px; }.isr-stages > div { flex-direction: column; padding: 6px 2px; }.isr-stages b { font-size: 6px; }
   .route-node small { font-size: 6px; }.incident-map-view { height: 315px; }.analytics-kpis { grid-template-columns: 1fr; }
+}
+
+.sidebar-link { color: #cbd5e1; font-size: 13px; }
+.sidebar-group-label { color: #aebaca; font-size: 11px; }
+.network-selector b,.system-health b,.profile b { color: #f1f5f9; font-size: 13px; }
+.network-selector small,.system-health small,.profile small { color: #b4c0cf; font-size: 11px; }
+.breadcrumbs { color: #b4c0cf; font-size: 13px; }
+.welcome-heading p:not(.eyebrow),.page-heading p:not(.eyebrow) { color: #cbd5e1; font-size: 13px; }
+.eyebrow { color: #8ce9dc; font-size: 11px; }
+.panel-heading h2,.map-toolbar h2 { color: #f1f5f9; font-size: 18px; font-weight: 700; }
+.overview-metric-label,.overview-metric strong small,.metric-trend { color: #cbd5e1; font-size: 12px; font-weight: 500; }
+.overview-metric strong { font-size: 24px; }
+.intersection-info b { color: #f1f5f9; font-size: 13px; }
+.intersection-info small,.status-label,.panel-link,.text-link,.incident-count,.chart-window { color: #cbd5e1; font-size: 12px; }
+.status-label { font-weight: 600; }
+.incident-item b,.quick-action b { color: #f1f5f9; font-size: 16px; font-weight: 600; }
+.incident-item small,.quick-action small { color: #cbd5e1; font-size: 12px; }
+.panel-heading h2,.map-toolbar h2,.junction-panel h3 { color: #f1f5f9; font-size: 18px; font-weight: 700; }
+.metric-card > span,.metric-card > small,.chart-caption,.junction-stats span,.junction-phase { color: #cbd5e1; font-size: 12px; }
+.metric-card strong,.junction-stats strong { color: #f1f5f9; font-size: 16px; }
+.incident-log-copy b { color: #f1f5f9; font-size: 14px; }
+.incident-log-copy small,.empty-events,.incident-impact p { color: #cbd5e1; font-size: 12px; }
+.safety-status strong { font-size: 16px; }
+.safety-heading > span,.safety-meters span,.safety-meters strong,.safety-log p,.roadblock-note { color: #cbd5e1; font-size: 12px; }
+.safety-test-button,.roadblock-button { font-size: 12px; }
+.severity { font-size: 10px; }
+.map-live,.map-legend span,.map-footer,.map-float-metric span { font-size: 11px; }
+.corridor-location-badge { padding: 6px 12px; border-color: #06b6d466; border-radius: 6px; background: rgba(15, 23, 42, .9); }
+.corridor-location-badge strong { color: #67e8f9; font-size: 14px; font-weight: 700; letter-spacing: .05em; line-height: 1.5; }
+.corridor-location-badge span { color: #cbd5e1; font-size: 12px; font-weight: 500; }
+.back-overview-button { cursor: pointer; }
+.scheduler-traffic-canvas { display: block; width: 100%; height: 100%; }
+.approach-status-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; margin-top: 10px; }
+.approach-status { display: grid; grid-template-columns: 8px 1fr auto; align-items: center; gap: 5px 8px; padding: 9px 10px; border: 1px solid #334155; border-radius: 8px; background: #0d1520; color: #e2e8f0; }
+.approach-status i { grid-row: span 2; width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
+.approach-status b { font-size: 12px; font-weight: 800; }
+.approach-status span { grid-column: 2; color: #cbd5e1; font-size: 11px; }
+.approach-status strong { grid-column: 3; grid-row: 1 / span 2; font-size: 10px; }
+.approach-north { color: #EC4899; }.approach-east { color: #3B82F6; }.approach-south { color: #8B5CF6; }.approach-west { color: #F59E0B; }
+.scheduler-overlay { font-size: 12px; }
+.scheduler-overlay small { color: #cbd5e1; font-size: 11px; }
+.approach-status strong { font-size: 11px; }
+.page-back-row { display: flex; justify-content: flex-start; margin: 0 0 18px; }
+.back-overview-button { padding: 9px 13px; color: #e2e8f0; border: 1px solid #425064; border-radius: 8px; background: #111a27; font-size: 13px; font-weight: 700; cursor: pointer; transition: .18s ease; }
+.back-overview-button:hover { color: #67e8f9; border-color: #22d3ee; background: #10212b; }
+.map-scenario-status { position: absolute; z-index: 450; top: 12px; right: 12px; padding: 9px 12px; color: #dcfce7; border: 1px solid #22c55e88; border-radius: 8px; background: #052e16e8; box-shadow: 0 0 18px #22c55e44; font-size: 12px; font-weight: 800; letter-spacing: .04em; animation: scenario-status-pulse 1.4s ease-in-out infinite; }
+.map-scenario-status.coordination { color: #bbf7d0; }
+.ambulance-map-icon { display: grid; place-items: center; background: transparent; border: 0; font-size: 27px; filter: drop-shadow(0 0 5px #fff) drop-shadow(0 0 10px #22c55e); }
+.emergency-corridor-glow { filter: drop-shadow(0 0 12px #22c55e) drop-shadow(0 0 22px #22c55e); animation: corridor-pulse 1.2s ease-in-out infinite; }
+.emergency-corridor-active { filter: drop-shadow(0 0 7px #4ade80) drop-shadow(0 0 13px #22c55e); }
+.coordinated-vehicle-dot { filter: drop-shadow(0 0 5px #22c55e) drop-shadow(0 0 9px #fff); }
+.coordination-green-wave { filter: drop-shadow(0 0 7px #22c55e); animation: green-wave-dash 1s linear infinite; }
+@keyframes corridor-pulse { 50% { opacity: .55; } }
+@keyframes scenario-status-pulse { 50% { box-shadow: 0 0 25px #22c55e77; } }
+@keyframes green-wave-dash { to { stroke-dashoffset: -44; } }
+@media (prefers-reduced-motion: reduce) {
+  .map-scenario-status,.emergency-corridor-glow,.coordination-green-wave { animation: none; }
+}
+@media (max-width: 760px) {
+  .corridor-location-badge strong { font-size: 12px; }
+  .map-scenario-status { right: 8px; left: 8px; text-align: center; font-size: 10px; }
+  .approach-status-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }

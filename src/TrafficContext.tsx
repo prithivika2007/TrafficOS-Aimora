@@ -10,8 +10,10 @@ import {
 import {
   JUNCTIONS,
   ROAD_DEFINITIONS,
+  JUNCTION_NAMES,
   AMBER_CLEARANCE_SECONDS,
   createNetworkState,
+  completeExpiredSafetyFailSafes,
   inspectSignalSafety,
   networkMetrics,
   stepNetwork,
@@ -21,6 +23,7 @@ import type { JunctionId, NetworkAlgorithm, NetworkMode, NetworkState } from "./
 import { createSim, defaultSetup } from "./simEngine";
 import type { Sim } from "./simEngine";
 import type { MutableRefObject } from "react";
+import { addEvent as addStoredEvent, clearEvents, setEventSimTime } from "./eventStore";
 
 export interface TelemetryPoint {
   time: number;
@@ -40,7 +43,7 @@ export interface TelemetryPoint {
 export interface TrafficEvent {
   id: string;
   tick: number;
-  kind: "arrival" | "served" | "phase" | "spillback" | "roadblock" | "safety";
+  kind: "arrival" | "served" | "phase" | "spillback" | "roadblock" | "safety" | "preemption";
   message: string;
   junction: JunctionId;
 }
@@ -69,6 +72,7 @@ interface TrafficContextValue {
   step: () => void;
   reset: () => void;
   setRoadBlock: (roadId: string, blocked: boolean) => void;
+  triggerJunctionPreemption: (junction: JunctionId, coordinated: boolean) => void;
   safetyTelemetry: SafetyTelemetry;
   testConflictIntercept: () => void;
   singleIntersection: MutableRefObject<Sim>;
@@ -119,7 +123,7 @@ function eventsFor(previous: NetworkState, next: NetworkState): TrafficEvent[] {
         id: `arrival-${next.tick}-${junction}`,
         tick: next.tick,
         kind: "arrival",
-        message: `Vehicle arrival queued at Junction ${junction}`,
+        message: `Vehicle arrival queued at ${JUNCTION_NAMES[junction]} (Junction ${junction})`,
         junction,
       });
     }
@@ -128,7 +132,7 @@ function eventsFor(previous: NetworkState, next: NetworkState): TrafficEvent[] {
         id: `phase-${next.tick}-${junction}`,
         tick: next.tick,
         kind: "phase",
-        message: `Signal phase changed at Junction ${junction}`,
+        message: `Signal phase changed at ${JUNCTION_NAMES[junction]} (Junction ${junction})`,
         junction,
       });
     }
@@ -148,7 +152,7 @@ function eventsFor(previous: NetworkState, next: NetworkState): TrafficEvent[] {
       id: `spillback-${incident.tick}-${incident.roadId}`,
       tick: incident.tick,
       kind: "spillback",
-      message: `Downstream capacity reached on ${road.from} → ${road.to}`,
+      message: `Downstream capacity reached on ${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]}`,
       junction: road.to,
     });
   });
@@ -179,6 +183,7 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     const next = { independent, coordinated };
     statesRef.current = next;
     setStates(next);
+    setEventSimTime(coordinated.tick * 0.5);
     const independentMetrics = networkMetrics(independent);
     const coordinatedMetrics = networkMetrics(coordinated);
     const contextSwitches = JUNCTIONS.reduce(
@@ -207,7 +212,25 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
       ...eventsFor(previous.coordinated, coordinated),
       ...eventsFor(previous.independent, independent).filter((event) => event.kind === "spillback"),
     ].map((event) => ({ ...event, id: `${event.id}-${eventCounter.current++}` }));
-    if (addedEvents.length) setEvents((current) => [...addedEvents, ...current].slice(0, 30));
+    if (addedEvents.length) {
+      addedEvents.forEach((event) => {
+        if (event.kind === "phase") {
+          addStoredEvent({
+            type: "SIGNAL",
+            severity: "info",
+            message: `${JUNCTION_NAMES[event.junction]}: Phase switch`,
+          });
+        } else if (event.kind === "spillback") {
+          addStoredEvent({
+            type: "ACCIDENT",
+            severity: "warn",
+            lane: event.message,
+            message: event.message,
+          });
+        }
+      });
+      setEvents((current) => [...addedEvents, ...current].slice(0, 30));
+    }
   }, [algorithm]);
 
   useEffect(() => {
@@ -218,10 +241,25 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      const activeState = statesRef.current[mode];
+      const previous = statesRef.current;
+      const independent = completeExpiredSafetyFailSafes(previous.independent);
+      const coordinated = completeExpiredSafetyFailSafes(previous.coordinated);
+      const next = independent === previous.independent && coordinated === previous.coordinated
+        ? previous
+        : { independent, coordinated };
+      if (next !== previous) {
+        statesRef.current = next;
+        setStates(next);
+      }
+      const activeState = next[mode];
       const inspection = inspectSignalSafety(activeState);
       const clearanceSeconds = Math.max(
-        ...JUNCTIONS.map((junction) => activeState.signalSafety[junction].clearanceTicks * 0.5)
+        ...JUNCTIONS.map((junction) => {
+          const safety = activeState.signalSafety[junction];
+          return safety.failSafeUntil === null
+            ? safety.clearanceTicks * 0.5
+            : Math.max(0, (safety.failSafeUntil - Date.now()) / 1000);
+        })
       );
       const allRedJunctions = JUNCTIONS.filter(
         (junction) => activeState.signalSafety[junction].mode === "ALL_RED"
@@ -255,6 +293,8 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     setStates(initial);
     setHistory([initialPoint()]);
     setEvents([]);
+    clearEvents();
+    setEventSimTime(0);
     setSafetyTelemetry(initialSafetyTelemetry());
     eventCounter.current = 0;
     singleIntersection.current = createSim(defaultSetup(), "RR");
@@ -269,11 +309,30 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     };
     statesRef.current = next;
     setStates(next);
+    const violationAuditCount = JUNCTIONS.reduce(
+      (count, node) => count + next[mode].signalSafety[node].violationAuditCount,
+      0
+    );
+    setSafetyTelemetry((current) => ({
+      ...current,
+      status: "CONFLICT",
+      mutexStatus: "FAIL-SAFE · 1 ALL-RED",
+      clearanceSeconds: AMBER_CLEARANCE_SECONDS,
+      violationAuditCount,
+      inspectedAt: Date.now(),
+      logs: [`${JUNCTION_NAMES[junction]}: illegal conflicting-green request intercepted; all-red fail-safe engaged.`],
+    }));
+    setEventSimTime(previous[mode].tick * 0.5);
+    addStoredEvent({
+      type: "SAFETY",
+      severity: "critical",
+      message: `⚠️ Safety Guardian intercepted illegal signal conflict at ${JUNCTION_NAMES[junction]} (Junction ${junction})`,
+    });
     const event: TrafficEvent = {
       id: `safety-test-${eventCounter.current++}`,
       tick: previous[mode].tick,
       kind: "safety",
-      message: `Junction ${junction}: conflicting green request intercepted; ALL-RED fail-safe engaged for ${AMBER_CLEARANCE_SECONDS.toFixed(1)}s`,
+      message: `SAFETY VIOLATION DETECTED — FAILSAFE ENGAGED · ${JUNCTION_NAMES[junction]} (Junction ${junction})`,
       junction,
     };
     setEvents((current) => [event, ...current].slice(0, 30));
@@ -290,6 +349,10 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     const update = (state: NetworkState): NetworkState => ({
       ...state,
       roadBlocks: { ...state.roadBlocks, [roadId]: blocked },
+      links: {
+        ...state.links,
+        [roadId]: { ...state.links[roadId], blocked },
+      },
     });
     const next = {
       independent: update(previous.independent),
@@ -297,12 +360,69 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     };
     statesRef.current = next;
     setStates(next);
+    const message = blocked
+      ? `🚧 Roadblock injected: Lane ${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]} closed. Rerouting active traffic.`
+      : `✅ Roadblock cleared: Lane ${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]} reopened.`;
+    setEventSimTime(previous[mode].tick * 0.5);
+    addStoredEvent({
+      type: blocked ? "ACCIDENT" : "SIGNAL",
+      severity: blocked ? "warn" : "info",
+      lane: `${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]}`,
+      message,
+    });
     const event: TrafficEvent = {
       id: `roadblock-${roadId}-${blocked ? "active" : "cleared"}-${eventCounter.current++}`,
       tick: previous[mode].tick,
       kind: "roadblock",
-      message: `${road.from} → ${road.to} lane ${blocked ? "blocked; detours activated" : "reopened"}`,
+      message,
       junction: road.to,
+    };
+    setEvents((current) => [event, ...current].slice(0, 30));
+  }, [mode]);
+
+  const triggerJunctionPreemption = useCallback((junction: JunctionId, coordinated: boolean) => {
+    const approachByJunction: Record<JunctionId, string> = {
+      A: "BA",
+      B: "AB",
+      C: "AC",
+      D: "CD",
+    };
+    const targetApproach = approachByJunction[junction];
+    const previous = statesRef.current;
+    const update = (state: NetworkState): NetworkState => {
+      if (state.signalSafety[junction].mode === "ALL_RED") return state;
+      const incoming = ROAD_DEFINITIONS.filter((road) => road.to === junction);
+      const phase = Math.max(0, incoming.findIndex((road) => road.id === targetApproach));
+      return {
+        ...state,
+        phases: { ...state.phases, [junction]: phase },
+        phaseTicks: { ...state.phaseTicks, [junction]: 0 },
+      };
+    };
+    const independent = update(previous.independent);
+    const coordinatedState = update(previous.coordinated);
+    const next = independent === previous.independent && coordinatedState === previous.coordinated
+      ? previous
+      : { independent, coordinated: coordinatedState };
+    if (next !== previous) {
+      statesRef.current = next;
+      setStates(next);
+    }
+    const message = coordinated
+      ? `Green-wave synchronized at ${JUNCTION_NAMES[junction]} (Junction ${junction})`
+      : `ISR preemption lock granted at ${JUNCTION_NAMES[junction]} (Junction ${junction})`;
+    setEventSimTime(previous[mode].tick * 0.5);
+    addStoredEvent({
+      type: "EMERGENCY",
+      severity: coordinated ? "info" : "critical",
+      message,
+    });
+    const event: TrafficEvent = {
+      id: `preemption-${junction}-${eventCounter.current++}`,
+      tick: previous[mode].tick,
+      kind: "preemption",
+      message,
+      junction,
     };
     setEvents((current) => [event, ...current].slice(0, 30));
   }, [mode]);
@@ -322,13 +442,14 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
       step,
       reset,
       setRoadBlock,
+      triggerJunctionPreemption,
       safetyTelemetry,
       testConflictIntercept,
       singleIntersection,
       simulationRevision,
       notifySimulationUpdate,
     }),
-    [states, history, events, running, mode, algorithm, start, pause, step, reset, setRoadBlock, safetyTelemetry, testConflictIntercept, simulationRevision, notifySimulationUpdate]
+    [states, history, events, running, mode, algorithm, start, pause, step, reset, setRoadBlock, triggerJunctionPreemption, safetyTelemetry, testConflictIntercept, simulationRevision, notifySimulationUpdate]
   );
   return <TrafficContext.Provider value={value}>{children}</TrafficContext.Provider>;
 }

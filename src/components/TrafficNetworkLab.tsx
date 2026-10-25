@@ -100,7 +100,7 @@ export default function TrafficNetworkLab(): React.JSX.Element {
       </div>
       <div className="lab-layout">
         <section className="panel network-panel">
-          <div className="panel-heading"><div><p className="eyebrow">NETWORK TOPOLOGY</p><h2>Four-junction corridor</h2></div>
+          <div className="panel-heading"><div><p className="eyebrow">ANNA SALAI · CHENNAI</p><h2>Four-junction corridor</h2></div>
             <span className="live-clock"><Activity size={14} /> T+{(selectedState.tick * 0.5).toFixed(1)}s</span></div>
           <div className="network-diagram">
             <div className="network-road horizontal-road" />

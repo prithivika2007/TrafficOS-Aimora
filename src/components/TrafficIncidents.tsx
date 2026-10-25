@@ -1,43 +1,44 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { CircleMarker, MapContainer, Polyline, TileLayer, Tooltip, useMap } from "react-leaflet";
 import { AlertTriangle, Clock3, MapPin, ShieldCheck, X } from "lucide-react";
-import { inspectSignalSafety, JUNCTIONS, ROAD_DEFINITIONS, ROAD_CAPACITY } from "../networkEngine";
+import { inspectSignalSafety, JUNCTIONS, JUNCTION_NAMES, ROAD_DEFINITIONS, ROAD_CAPACITY } from "../networkEngine";
 import type { JunctionId } from "../networkEngine";
 import { useTraffic } from "../TrafficContext";
+import { getEvents, subscribeToEvents } from "../eventStore";
 
 const COORDINATES: Record<JunctionId, [number, number]> = {
-  A: [37.779, -122.421],
-  B: [37.784, -122.409],
-  C: [37.769, -122.411],
-  D: [37.778, -122.397],
+  A: [13.0524, 80.2510],
+  B: [13.0420, 80.2450],
+  C: [13.0301, 80.2414],
+  D: [13.0240, 80.2240],
 };
 
 const densityColor = (density: number): string =>
-  density > 0.75 ? "#ff0055" : density > 0.4 ? "#ffe600" : "#00f3ff";
+  density > 0.75 ? "#EF4444" : density > 0.4 ? "#ffe600" : "#00f3ff";
 
 export default function TrafficIncidents(): React.JSX.Element {
   const { events, states, mode, setRoadBlock, safetyTelemetry, testConflictIntercept } = useTraffic();
+  const storedEvents = useSyncExternalStore(subscribeToEvents, getEvents, getEvents);
   const state = states[mode];
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const spillbacks = ROAD_DEFINITIONS.filter((road) => state.blockedRoads[road.id]);
   const roadBlocks = ROAD_DEFINITIONS.filter((road) => state.roadBlocks[road.id]);
   const safety = inspectSignalSafety(state);
-  const records = useMemo(
-    () => events.filter((event) =>
-      event.kind === "spillback" || event.kind === "phase" || event.kind === "roadblock" || event.kind === "safety"
-    ),
-    [events]
+  const records = useMemo(() => storedEvents.slice().reverse(), [storedEvents]);
+  const incidents = events.filter((event) =>
+    event.kind === "spillback" || event.kind === "phase" || event.kind === "roadblock" ||
+    event.kind === "safety" || event.kind === "preemption"
   );
-  const incidents = records.length
-    ? records
+  const mapIncidents = incidents.length
+    ? incidents
     : spillbacks.map((road) => ({
         id: `blocked-${road.id}`,
         tick: state.tick,
         kind: "spillback" as const,
-        message: `Queue spillback on link ${road.from} → ${road.to}`,
+        message: `Queue spillback on link ${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]}`,
         junction: road.to,
       }));
-  const selected = incidents.find((event) => event.id === selectedId) ?? incidents[0];
+  const selected = mapIncidents.find((event) => event.id === selectedId) ?? mapIncidents[0];
 
   return (
     <div className="content-page">
@@ -45,7 +46,7 @@ export default function TrafficIncidents(): React.JSX.Element {
       <section className={`panel safety-guardian ${safety.clear ? "safety-clear" : "safety-conflict"}`}>
         <div className="safety-heading">
           <div className="safety-status"><ShieldCheck size={18} /><strong>🛡️ Safety Guardian Console</strong></div>
-          <span className="guardian-clearance-badge">STATUS: {safety.clear ? "ACTIVE / NO CONFLICTS" : "CONFLICT DETECTED"}</span>
+          <span className="guardian-clearance-badge">STATUS: {safetyTelemetry.status === "CONFLICT" ? "SAFETY VIOLATION DETECTED — FAILSAFE ENGAGED" : "ACTIVE / NO CONFLICTS"}</span>
         </div>
         <div className="safety-meters">
           <div><span>Signal Phase Locks</span><strong>{safetyTelemetry.mutexStatus}</strong></div>
@@ -73,7 +74,7 @@ export default function TrafficIncidents(): React.JSX.Element {
                 aria-pressed={active}
               >
                 <AlertTriangle size={14} />
-                {active ? `Clear ${road.from} → ${road.to} roadblock` : `Inject accident on ${road.from} → ${road.to} lane`}
+                {active ? `Clear ${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]} roadblock` : `Inject accident on ${JUNCTION_NAMES[road.from]} → ${JUNCTION_NAMES[road.to]} lane`}
               </button>
             );
           })}
@@ -82,21 +83,25 @@ export default function TrafficIncidents(): React.JSX.Element {
       </section>
       <div className="incident-map-layout">
         <section className="map-shell incident-map-shell">
-          <div className="map-toolbar"><div><p className="eyebrow">ALERT & CLOSURE MAP</p><h2>Flow impact · Central District</h2></div><span className="chart-window">T+{(state.tick * 0.5).toFixed(1)}s</span></div>
+          <div className="map-toolbar"><div><p className="eyebrow">ALERT & CLOSURE MAP</p><h2>Flow impact · Chennai Smart Grid</h2></div><span className="chart-window">T+{(state.tick * 0.5).toFixed(1)}s</span></div>
+          <div className="corridor-location-badge">
+            <strong>📍 CORRIDOR: Anna Salai (Mount Road), Chennai | JUNCTIONS: Gemini Flyover · Teynampet · Nandanam · Saidapet</strong>
+            <span>4 Adaptive Nodes Active · JICA Intelligent Transport System (ITS) Integration</span>
+          </div>
           <div className="incident-map-view">
-            <MapContainer center={COORDINATES[selected?.junction ?? "D"]} zoom={14} scrollWheelZoom className="leaflet-map">
+            <MapContainer center={[13.0420, 80.2450]} zoom={14} scrollWheelZoom className="leaflet-map">
               <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
               <FocusIncident junction={selected?.junction} />
               {ROAD_DEFINITIONS.filter((road) => road.from < road.to).map((road) => (
                 <Polyline key={road.id} positions={[COORDINATES[road.from], COORDINATES[road.to]]} pathOptions={{
                   color: state.roadBlocks[road.id] || state.roadBlocks[`${road.to}${road.from}`]
-                    ? "#ff0055"
-                    : state.blockedRoads[road.id] || state.blockedRoads[`${road.to}${road.from}`] ? "#ffe600" : "#00f3ff",
-                  weight: state.roadBlocks[road.id] || state.roadBlocks[`${road.to}${road.from}`] ? 7 : 6,
-                  opacity: 1,
+                      ? "#991B1B"
+                      : state.blockedRoads[road.id] || state.blockedRoads[`${road.to}${road.from}`] ? "#EF4444" : "#DC2626",
+                    weight: 6,
+                    opacity: 0.9,
                   dashArray: state.roadBlocks[road.id] || state.roadBlocks[`${road.to}${road.from}`] ||
                     state.blockedRoads[road.id] || state.blockedRoads[`${road.to}${road.from}`] ? "8 7" : undefined,
-                  className: `neon-road road-flow ${state.roadBlocks[road.id] || state.roadBlocks[`${road.to}${road.from}`] ? "road-severe" : state.blockedRoads[road.id] || state.blockedRoads[`${road.to}${road.from}`] ? "road-moderate" : ""}`,
+                    className: `neon-road road-flow ${state.roadBlocks[road.id] || state.roadBlocks[`${road.to}${road.from}`] ? "road-detour" : state.blockedRoads[road.id] || state.blockedRoads[`${road.to}${road.from}`] ? "road-severe" : ""}`,
                 }} />
               ))}
               {JUNCTIONS.map((junction) => {
@@ -118,42 +123,56 @@ export default function TrafficIncidents(): React.JSX.Element {
                       className: `neon-node ${failSafe || density > 0.75 ? "node-severe" : density > 0.4 ? "node-moderate" : "node-clear"}`,
                     }}
                   >
-                    <Tooltip>Junction {junction}{failSafe ? " · ALL-RED FAIL-SAFE" : ""}</Tooltip>
+                    <Tooltip>{JUNCTION_NAMES[junction]} · Junction {junction}{failSafe ? " · ALL-RED FAIL-SAFE" : ""}</Tooltip>
                   </CircleMarker>
                 );
               })}
-              {incidents.map((event) => (
+              {mapIncidents.map((event) => (
                 <CircleMarker key={event.id} center={COORDINATES[event.junction]} radius={selected?.id === event.id ? 12 : 8}
                     pathOptions={{
                       color: "#ffffff",
-                      fillColor: event.kind === "spillback" || event.kind === "safety" ? "#ff0055" : "#ffe600",
+                      fillColor: event.kind === "spillback" || event.kind === "safety"
+                        ? "#ff0055"
+                        : event.kind === "preemption" ? "#22c55e" : "#ffe600",
                       fillOpacity: 0.95,
                       weight: 3,
-                      className: `neon-node ${event.kind === "spillback" || event.kind === "safety" ? "node-severe" : "node-moderate"}`,
+                      className: `neon-node ${event.kind === "spillback" || event.kind === "safety" ? "node-severe" : event.kind === "preemption" ? "node-clear" : "node-moderate"}`,
                     }}
                   eventHandlers={{ click: () => setSelectedId(event.id) }}>
-                  <Tooltip>Junction {event.junction} · {event.kind}</Tooltip>
+                  <Tooltip>{JUNCTION_NAMES[event.junction]} · {event.kind}</Tooltip>
                 </CircleMarker>
               ))}
-              {roadBlocks.map((road) => <Polyline key={`closure-${road.id}`} positions={[COORDINATES[road.from], COORDINATES[road.to]]} pathOptions={{ color: "#ff0055", weight: 11, opacity: 0.55, className: "neon-road road-severe road-warning" }} />)}
-              {spillbacks.map((road) => <Polyline key={`spillback-${road.id}`} positions={[COORDINATES[road.from], COORDINATES[road.to]]} pathOptions={{ color: "#ffe600", weight: 10, opacity: 0.55, className: "neon-road road-moderate road-warning" }} />)}
+              {roadBlocks.map((road) => {
+                const from = COORDINATES[road.from];
+                const to = COORDINATES[road.to];
+                const midpoint: [number, number] = [(from[0] + to[0]) / 2, (from[1] + to[1]) / 2];
+                return (
+                  <Fragment key={`closure-layer-${road.id}`}>
+                    <Polyline key={`closure-${road.id}`} positions={[from, to]} pathOptions={{ color: "#991B1B", weight: 7, opacity: 0.9, dashArray: "8 7", className: "neon-road road-detour road-warning" }} />
+                    <CircleMarker key={`hazard-${road.id}`} center={midpoint} radius={9} pathOptions={{ color: "#ff0055", fillColor: "#ffe600", fillOpacity: 1, weight: 4, className: "neon-node node-severe road-warning" }}>
+                      <Tooltip>🚧 CLOSED · Lane {JUNCTION_NAMES[road.from]} → {JUNCTION_NAMES[road.to]}</Tooltip>
+                    </CircleMarker>
+                  </Fragment>
+                );
+              })}
+              {spillbacks.map((road) => <Polyline key={`spillback-${road.id}`} positions={[COORDINATES[road.from], COORDINATES[road.to]]} pathOptions={{ color: "#EF4444", weight: 7, opacity: 0.9, className: "neon-road road-severe road-warning" }} />)}
             </MapContainer>
             <div className="closure-key"><span><i className="closure-red" /> Roadblock / spillback</span><span><i className="closure-amber" /> Detour / phase event</span></div>
           </div>
           <div className="sim-disclaimer">SIMULATION MODEL — SYNTHETIC TRAFFIC DATA FOR ALGORITHMIC BENCHMARKING</div>
         </section>
         <section className="panel incident-log">
-          <div className="panel-heading"><div><p className="eyebrow">TIMESTAMPED EVENT LOG</p><h2>{incidents.length} event{incidents.length === 1 ? "" : "s"}</h2></div><Clock3 size={16} /></div>
+          <div className="panel-heading"><div><p className="eyebrow">TIMESTAMPED EVENT LOG</p><h2>{records.length} event{records.length === 1 ? "" : "s"}</h2></div><Clock3 size={16} /></div>
           <div className="incident-log-list">
-            {incidents.length === 0 ? <p className="empty-events">No incidents yet. Start the kernel to generate events.</p> : incidents.map((event) => (
-              <button className={`incident-log-entry ${selected?.id === event.id ? "selected" : ""}`} key={event.id} onClick={() => setSelectedId(event.id)}>
-                <span className={`incident-icon ${event.kind === "spillback" || event.kind === "safety" ? "red" : "amber"}`}><AlertTriangle size={15} /></span>
-                <span className="incident-log-copy"><b>{event.message}</b><small>Junction {event.junction} · {((event.tick * 0.5)).toFixed(1)}s</small><small>Flow impact: {event.kind === "spillback" ? `${ROAD_CAPACITY} vehicle/link capacity reached` : event.kind === "roadblock" ? "incoming traffic routed around closed lane" : event.kind === "safety" ? "contradictory greens rejected; all-red clearance enforced" : "signal phase changed"}</small></span>
+            {records.length === 0 ? <p className="empty-events">No incidents yet. Start the kernel to generate events.</p> : records.map((event) => (
+              <article className="incident-log-entry" key={event.id}>
+                <span className={`incident-icon ${event.severity === "critical" || event.severity === "warn" ? "red" : "amber"}`}><AlertTriangle size={15} /></span>
+                <span className="incident-log-copy"><b>{event.message}</b><small>[T+{event.simulationSeconds.toFixed(1)}s] · {event.wallTime}</small><small>{event.type}{event.lane ? ` · ${event.lane}` : ""} · {event.simTime}</small></span>
                 <MapPin size={14} />
-              </button>
+              </article>
             ))}
           </div>
-          {selected && <div className="incident-impact"><button aria-label="Close incident details" onClick={() => setSelectedId(null)}><X size={13} /></button><b>Flow impact</b><p>Junction {selected.junction} event at simulation second {(selected.tick * 0.5).toFixed(1)}. The map is focused on the affected node and surrounding links.</p></div>}
+          {selected && <div className="incident-impact"><button aria-label="Close incident details" onClick={() => setSelectedId(null)}><X size={13} /></button><b>Flow impact</b><p>{JUNCTION_NAMES[selected.junction]} (Junction {selected.junction}) event at simulation second {(selected.tick * 0.5).toFixed(1)}. The map is focused on the affected node and surrounding links.</p></div>}
         </section>
       </div>
     </div>
