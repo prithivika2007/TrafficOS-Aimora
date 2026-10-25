@@ -25,6 +25,7 @@ import {
   Zap,
 } from "lucide-react";
 import LiveTrafficConsole from "./components/LiveTrafficConsole";
+import SplashScreen from "./components/SplashScreen";
 import { TrafficProvider, useTraffic } from "./TrafficContext";
 import { JUNCTIONS, JUNCTION_NAMES, ROAD_CAPACITY, ROAD_DEFINITIONS, networkMetrics } from "./networkEngine";
 import type { JunctionId, NetworkState } from "./networkEngine";
@@ -63,7 +64,23 @@ const PAGE_TITLES: Record<PageId, string> = {
 const cx = (...values: Parameters<typeof clsx>): string => twMerge(clsx(...values));
 
 export default function App(): React.JSX.Element {
-  return <TrafficProvider><DashboardShell /></TrafficProvider>;
+  const [initialized, setInitialized] = useState(false);
+  return (
+    <AnimatePresence mode="wait">
+      {initialized ? (
+        <motion.div
+          key="dashboard"
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.45, ease: "easeOut" }}
+        >
+          <TrafficProvider><DashboardShell /></TrafficProvider>
+        </motion.div>
+      ) : (
+        <SplashScreen key="splash" onInitialize={() => setInitialized(true)} />
+      )}
+    </AnimatePresence>
+  );
 }
 
 function DashboardShell(): React.JSX.Element {
@@ -157,18 +174,26 @@ function DashboardShell(): React.JSX.Element {
       </aside>
       {mobileNavOpen && <button className="nav-scrim" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
       <div className="app-main">
-        <header className="topbar">
-          <div className="topbar-left"><button className="mobile-menu" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu size={20} /></button><span className="breadcrumbs">{breadcrumbGroup} / <b>{activePage === "overview" ? "Overview" : PAGE_TITLES[activePage]}</b></span></div>
-          <div className="topbar-right">
+        {/* Enlarged Top Bar */}
+        <header className="topbar" style={{ minHeight: "72px", padding: "0 24px" }}>
+          <div className="topbar-left">
+            <button className="mobile-menu" onClick={() => setMobileNavOpen(true)} aria-label="Open navigation"><Menu size={22} /></button>
+            <span className="breadcrumbs" style={{ fontSize: "14px" }}>{breadcrumbGroup} / <b style={{ color: "#38bdf8" }}>{activePage === "overview" ? "Overview" : PAGE_TITLES[activePage]}</b></span>
+          </div>
+          <div className="topbar-right" style={{ gap: "16px" }}>
             <div className="global-controls">
-              <button className="global-control-primary" onClick={running ? pause : start} aria-label={running ? "Pause simulation" : "Start simulation"}>{running ? "Ⅱ" : "▶"}<span>{running ? "Pause" : "Start"}</span></button>
-              <button onClick={step} disabled={running} aria-label="Step simulation">Step</button>
-              <button onClick={reset} aria-label="Reset simulation"><span>↻</span></button>
+              <button style={{ padding: "8px 16px", fontSize: "13px", fontWeight: 700 }} className="global-control-primary" onClick={running ? pause : start} aria-label={running ? "Pause simulation" : "Start simulation"}>{running ? "Ⅱ" : "▶"}<span>{running ? "Pause" : "Start"}</span></button>
+              <button style={{ padding: "8px 12px", fontSize: "13px", fontWeight: 700 }} onClick={step} disabled={running} aria-label="Step simulation">Step</button>
+              <button style={{ padding: "8px 10px", fontSize: "13px" }} onClick={reset} aria-label="Reset simulation"><span>↻</span></button>
             </div>
-            <span className={`guardian-header-badge ${safetyTelemetry.status === "CONFLICT" ? "conflict" : ""}`}>
-              <ShieldCheck size={13} /> SAFETY GUARDIAN · {safetyTelemetry.status === "ACTIVE" ? "ACTIVE / NO CONFLICTS" : "SAFETY VIOLATION DETECTED — FAILSAFE ENGAGED"}
+            <span style={{ fontSize: "12px", padding: "6px 12px", fontWeight: 700 }} className={`guardian-header-badge ${safetyTelemetry.status === "CONFLICT" ? "conflict" : ""}`}>
+              <ShieldCheck size={15} /> SAFETY GUARDIAN · {safetyTelemetry.status === "ACTIVE" ? "ACTIVE / NO CONFLICTS" : "SAFETY VIOLATION DETECTED — FAILSAFE ENGAGED"}
             </span>
-            <span className={`sync-status ${running ? "is-running" : ""}`}><i /> {running ? "Kernel running" : "Kernel paused"}</span><span className="topbar-divider" /><span className="clock"><Clock3 size={14} />{time}</span><span className="topbar-divider" /><span className="cpu-status"><Gauge size={14} />{currentQueueCount} queued</span>
+            <span style={{ fontSize: "13px", fontWeight: 600 }} className={`sync-status ${running ? "is-running" : ""}`}><i /> {running ? "Kernel running" : "Kernel paused"}</span>
+            <span className="topbar-divider" />
+            <span className="clock" style={{ fontSize: "14px", fontWeight: 700 }}><Clock3 size={16} />{time}</span>
+            <span className="topbar-divider" />
+            <span className="cpu-status" style={{ fontSize: "13px", fontWeight: 700 }}><Gauge size={16} />{currentQueueCount} queued</span>
           </div>
         </header>
         <main className="main-content">
@@ -808,7 +833,7 @@ function LearnPage({ navigate }: { navigate: (page: PageId) => void }): React.JS
     <div className="learn-grid">
       <article className="panel learn-card"><span className="learn-number">01</span><span className="learn-icon"><Settings2 size={20} /></span><h2>Round Robin scheduling</h2><p>Each approach gets a fair green-light time slice. Like CPU time-sharing, a fixed quantum prevents one lane from monopolizing the intersection.</p><div className="analogy"><b>OS analogy</b><span>Time quantum → green phase duration</span></div></article>
       <article className="panel learn-card"><span className="learn-number">02</span><span className="learn-icon amber"><Activity size={20} /></span><h2>Priority + aging</h2><p>Emergency vehicles receive priority, while waiting traffic gradually gains weight to reduce starvation and keep service equitable.</p><div className="analogy"><b>OS analogy</b><span>Process priority → lane priority score</span></div></article>
-      <article className="panel learn-card"><span className="learn-number">03</span><span className="learn-icon rose"><Waypoints size={20} /></span><h2>Network coordination</h2><p>Neighboring signals share downstream capacity and queue telemetry. Green waves move traffic onward without pushing it into blocked links.</p><div className="analogy"><b>OS analogy</b><span>Backpressure → resource-aware scheduling</span></div></article>
+      <article className="panel learn-card"><span className="learn-icon rose"><Waypoints size={20} /></span><h2>Network coordination</h2><p>Neighboring signals share downstream capacity and queue telemetry. Green waves move traffic onward without pushing it into blocked links.</p><div className="analogy"><b>OS analogy</b><span>Backpressure → resource-aware scheduling</span></div></article>
       <article className="panel learn-card"><span className="learn-number">04</span><span className="learn-icon amber"><Siren size={20} /></span><h2>Mutexes & interrupts</h2><p>A junction grants one approach exclusive green access at a time. Emergency vehicles request an interrupt, triggering safe clearance, protected passage, then recovery.</p><div className="analogy"><b>OS analogy</b><span>Intersection mutex → exclusive green · ISR → emergency preemption</span></div></article>
     </div>
     <div className="learn-telemetry panel"><span className={`telemetry-pulse ${running ? "running" : ""}`} /><div><p className="eyebrow">SHARED KERNEL STATE</p><b>{running ? "Simulation running" : "Simulation paused"} · {mode.toUpperCase()} control</b></div><span><b>T+{(state.tick * .5).toFixed(1)}s</b><small>clock</small></span><span><b>{queuedVehicles}</b><small>queued vehicles</small></span><span><b>{latest.contextSwitches}</b><small>switches / tick</small></span></div>

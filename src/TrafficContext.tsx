@@ -176,7 +176,7 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     []
   );
 
-  const step = useCallback(() => {
+  const advanceNetworkTick = useCallback(() => {
     const previous = statesRef.current;
     const independent = stepNetwork(previous.independent, "independent", algorithm);
     const coordinated = stepNetwork(previous.coordinated, "coordinated", algorithm);
@@ -233,11 +233,16 @@ export function TrafficProvider({ children }: { children: React.ReactNode }): Re
     }
   }, [algorithm]);
 
+  const step = useCallback(() => {
+    if (running) return;
+    advanceNetworkTick();
+  }, [advanceNetworkTick, running]);
+
   useEffect(() => {
     if (!running) return;
-    const timer = window.setInterval(step, 500);
+    const timer = window.setInterval(advanceNetworkTick, 500);
     return () => window.clearInterval(timer);
-  }, [running, step]);
+  }, [running, advanceNetworkTick]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
