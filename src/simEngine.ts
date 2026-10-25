@@ -35,6 +35,13 @@ import { addEvent, setEventSimTime } from "./eventStore";
 
 export type Direction = "NORTH" | "EAST" | "SOUTH" | "WEST";
 export type Algo = "STATIC" | "RR" | "PRIORITY_AGING";
+export interface SchedulerAdaptation {
+  enabled: boolean;
+  trackComparison: boolean;
+  laneQuantums: Record<Direction, number>;
+  congestionScores: Record<Direction, number>;
+  priorityBoost: Direction | null;
+}
 export type EmergencyState =
   | "IDLE"
   | "CLEARING_TO_EMERGENCY"
@@ -60,6 +67,8 @@ export const CAR_SPEED = 35; // % of canvas per second
 export const HEADWAY = 1; // seconds between vehicles released on green (service time per vehicle)
 export const CLEARANCE = 1; // seconds of all-red between lanes (context-switch cost)
 export const AGING_STEP = 2; // a waiting lane gains one priority level every N seconds
+export const ADAPTIVE_STARVATION_LIMIT_SECONDS = 30;
+export const ADAPTIVE_PRIORITY_BOOST_LEVELS = 2;
 export const MAX_PER_LANE = 7;
 
 export interface Car {
@@ -200,6 +209,10 @@ export interface Sim {
   maxWaitByLane: Record<Direction, number>;
   waitSum: number;
   tatSum: number;
+  adaptationSamples: { time: number; wait: number; enabled: boolean }[];
+  adaptationExposure: { time: number; seconds: number; enabled: boolean }[];
+  adaptationMode: boolean;
+  adaptationTracking: boolean;
   emergencyVehicles: EmergencyVehicle[];
   emergencyId: string | null;
   emergencyLane: Direction | null;
@@ -221,6 +234,9 @@ export interface Sim {
   blockedLanes: Record<Direction, boolean>;
   incident: TrafficIncident | null;
   laneQuantumPlan: Record<Direction, number> | null;
+  adaptivePriorityBoost: Direction | null;
+  activeAdaptiveQuantum: number | null;
+  lastAdaptiveQuantums: Record<Direction, number | null>;
   started: boolean;
   finished: boolean;
 }
@@ -307,6 +323,10 @@ export function createSim(
     maxWaitByLane: { NORTH: 0, EAST: 0, SOUTH: 0, WEST: 0 },
     waitSum: 0,
     tatSum: 0,
+    adaptationSamples: [],
+    adaptationExposure: [],
+    adaptationMode: false,
+    adaptationTracking: false,
     emergencyId: null,
     emergencyLane: null,
     emergencyState: "IDLE",
@@ -328,6 +348,9 @@ export function createSim(
     blockedLanes: { NORTH: false, EAST: false, SOUTH: false, WEST: false },
     incident: null,
     laneQuantumPlan: null,
+    adaptivePriorityBoost: null,
+    activeAdaptiveQuantum: null,
+    lastAdaptiveQuantums: { NORTH: null, EAST: null, SOUTH: null, WEST: null },
     started: false,
     finished: false,
   };
@@ -437,6 +460,16 @@ function logSignalChanges(sim: Sim, algo: Algo, quantum: number) {
 function recordServedVehicle(sim: Sim, car: Car) {
   if (car.rogue) return;
   const wait = (car.releasedAt ?? sim.clock) - car.arrival;
+  if (sim.adaptationTracking) {
+    sim.adaptationSamples.push({
+      time: sim.clock,
+      wait,
+      enabled: sim.adaptationMode,
+    });
+    sim.adaptationSamples = sim.adaptationSamples.filter(
+      (sample) => sample.time >= sim.clock - 30
+    );
+  }
   sim.served++;
   sim.passedByLane[car.lane]++;
   if (!car.emergency) sim.ordinaryServed++;
@@ -601,22 +634,34 @@ export function addRogueVehicle(sim: Sim, lane: Direction): boolean {
 }
 
 export const effectivePriority = (sim: Sim, lane: Direction, aging: boolean): number => {
-  const base = sim.priority[lane];
+  const base = Math.max(
+    0,
+    sim.priority[lane] -
+      (sim.adaptivePriorityBoost === lane ? ADAPTIVE_PRIORITY_BOOST_LEVELS : 0)
+  );
   if (!aging) return base;
   const waited = sim.clock - sim.waitSince[lane];
   return Math.max(0, base - Math.floor(waited / AGING_STEP));
 };
 
 /** The scheduler: choose the next lane to get the green light (or null if nothing is waiting). */
-export function pickLane(sim: Sim, algo: Algo, aging: boolean): Direction | null {
+export function pickLane(
+  sim: Sim,
+  algo: Algo,
+  aging: boolean,
+  starvationGuard = false
+): Direction | null {
   const cands = DIRECTIONS.filter(
     (d) => queueLen(sim, d) > 0 && !sim.blockedLanes[d]
   );
   if (cands.length === 0) return null;
 
-  if (algo !== "STATIC") {
+  if (algo !== "STATIC" || starvationGuard) {
     const starved = cands
-      .filter((lane) => sim.starvation[lane] >= STARVATION_LIMIT_SECONDS)
+      .filter((lane) =>
+        sim.starvation[lane] >=
+        (starvationGuard ? ADAPTIVE_STARVATION_LIMIT_SECONDS : STARVATION_LIMIT_SECONDS)
+      )
       .sort((a, b) => sim.starvation[b] - sim.starvation[a]);
     if (starved.length > 0) return starved[0];
   }
@@ -649,10 +694,11 @@ export function pickLane(sim: Sim, algo: Algo, aging: boolean): Direction | null
   }
 }
 
-function startSlice(sim: Sim, lane: Direction) {
+function startSlice(sim: Sim, lane: Direction, adaptiveQuantum: number | null = null) {
   if (sim.lastLane && sim.lastLane !== lane) sim.contextSwitches++;
   sim.lastLane = lane;
   sim.active = lane;
+  sim.activeAdaptiveQuantum = adaptiveQuantum;
   sim.sliceElapsed = 0;
   sim.releaseTimer = HEADWAY; // first vehicle is released immediately
   sim.rrPtr = DIRECTIONS.indexOf(lane);
@@ -675,6 +721,29 @@ function endSlice(sim: Sim) {
   if (seg && seg.end === null) seg.end = sim.clock;
   sim.waitSince[lane] = sim.clock; // lane goes to the back of the line (aging restarts)
   sim.active = null;
+  sim.activeAdaptiveQuantum = null;
+}
+
+function adaptiveQuantumForLane(
+  sim: Sim,
+  lane: Direction,
+  quantum: number,
+  adaptation?: SchedulerAdaptation
+): number | null {
+  if (!adaptation?.enabled) return null;
+  const next = adaptation.laneQuantums[lane];
+  const previous = sim.lastAdaptiveQuantums[lane] ?? quantum;
+  if (Math.abs(previous - next) >= 0.05) {
+    emitEvent(
+      sim,
+      "SCHEDULER",
+      "info",
+      `Adaptation quantum changed ${lane} ${previous.toFixed(1)}s -> ${next.toFixed(1)}s at ${Math.round(adaptation.congestionScores[lane])}% congestion`,
+      lane
+    );
+  }
+  sim.lastAdaptiveQuantums[lane] = next;
+  return next;
 }
 
 function enterFailSafe(sim: Sim) {
@@ -747,10 +816,30 @@ function beginEmergencyClearance(sim: Sim, ambulance: EmergencyVehicle) {
   sim.logs.push("ISR SAFE CLEARANCE: 1.5s amber, then all-red lock");
 }
 
-function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) {
+function tick(
+  sim: Sim,
+  h: number,
+  algo: Algo,
+  quantum: number,
+  aging: boolean,
+  adaptation?: SchedulerAdaptation
+) {
   if (sim.finished) return;
   sim.started = true;
   sim.clock += h;
+  if (sim.adaptationTracking) {
+    sim.adaptationExposure.push({
+      time: sim.clock,
+      seconds: h,
+      enabled: sim.adaptationMode,
+    });
+    while (
+      sim.adaptationExposure.length > 0 &&
+      sim.adaptationExposure[0].time < sim.clock - 30
+    ) {
+      sim.adaptationExposure.shift();
+    }
+  }
   if (sim.incident && sim.incident.expiresAt !== null && sim.clock >= sim.incident.expiresAt) {
     clearRoadIncident(sim);
   }
@@ -761,7 +850,10 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
     sim.safety.phase === "GREEN"
   ) {
     endSlice(sim);
-    beginSafetySwitch(sim.safety, pickLane(sim, algo, aging));
+    beginSafetySwitch(
+      sim.safety,
+      pickLane(sim, algo, aging, adaptation?.enabled ?? false)
+    );
   }
   detectStopLineCrossings(sim);
 
@@ -926,13 +1018,28 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
           queueLen(sim, sim.safety.pendingLane) > 0 &&
           !sim.blockedLanes[sim.safety.pendingLane]
             ? sim.safety.pendingLane
-            : pickLane(sim, algo, aging);
+            : pickLane(sim, algo, aging, adaptation?.enabled ?? false);
         if (lane && approveGreenSwitch(sim.safety, sim.active, lane, sim.logs)) {
-          startSlice(sim, lane);
+          const adaptiveQuantum = adaptiveQuantumForLane(
+            sim,
+            lane,
+            quantum,
+            adaptation
+          );
+          if (!adaptation?.enabled) {
+            sim.lastAdaptiveQuantums[lane] = null;
+          }
+          startSlice(sim, lane, adaptiveQuantum);
           sim.starvation[lane] = 0;
           activateGreen(sim.safety);
           sim.logs.push(`${lane} GREEN`);
-          emitEvent(sim, "SCHEDULER", "info", `${lane} selected by ${algo}; quantum ${quantum}s`, lane);
+          emitEvent(
+            sim,
+            "SCHEDULER",
+            "info",
+            `${lane} selected by ${algo}; quantum ${adaptiveQuantum ?? quantum}s`,
+            lane
+          );
         } else if (lane) {
           sim.safety.pendingLane = null;
           sim.safety.remaining = 2;
@@ -984,7 +1091,9 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
         }
       }
     } else {
-      const activeQuantum = sim.laneQuantumPlan?.[lane] ?? quantum;
+      const activeQuantum = adaptation?.enabled
+        ? sim.activeAdaptiveQuantum ?? quantum
+        : sim.laneQuantumPlan?.[lane] ?? quantum;
       const expired = sim.sliceElapsed >= activeQuantum - 1e-9;
       if (!expired || sim.safety.greenElapsed < MIN_GREEN_SECONDS) {
         while (
@@ -1004,8 +1113,14 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
         maxGreenReached ||
         ((expired || empty) && sim.safety.greenElapsed >= MIN_GREEN_SECONDS)
       ) {
-        const next = pickLane(sim, algo, aging);
+        const next = pickLane(sim, algo, aging, adaptation?.enabled ?? false);
         if (next === lane && !empty && !maxGreenReached) {
+          sim.activeAdaptiveQuantum = adaptiveQuantumForLane(
+            sim,
+            lane,
+            quantum,
+            adaptation
+          );
           sim.sliceElapsed = 0;
         } else {
           endSlice(sim);
@@ -1072,13 +1187,52 @@ function tick(sim: Sim, h: number, algo: Algo, quantum: number, aging: boolean) 
 }
 
 /** Advance the simulation by `dt` seconds (internally split into small steps). */
-export function step(sim: Sim, dt: number, algo: Algo, quantum: number, aging: boolean) {
+export function step(
+  sim: Sim,
+  dt: number,
+  algo: Algo,
+  quantum: number,
+  aging: boolean,
+  adaptation?: SchedulerAdaptation
+) {
   const H = 0.05;
   let left = dt;
   recordWatchdogUpdate(sim.watchdog);
+  sim.adaptationMode = adaptation?.enabled ?? false;
+  sim.adaptationTracking = adaptation?.trackComparison ?? false;
+  const nextPriorityBoost = adaptation?.enabled ? adaptation.priorityBoost : null;
+  if (sim.adaptivePriorityBoost !== nextPriorityBoost) {
+    if (nextPriorityBoost) {
+      emitEvent(
+        sim,
+        "SCHEDULER",
+        "warn",
+        `Adaptation priority boost applied to ${nextPriorityBoost}`,
+        nextPriorityBoost
+      );
+    } else if (sim.adaptivePriorityBoost) {
+      emitEvent(
+        sim,
+        "SCHEDULER",
+        "info",
+        `Adaptation priority boost removed from ${sim.adaptivePriorityBoost}`,
+        sim.adaptivePriorityBoost
+      );
+    }
+    sim.adaptivePriorityBoost = nextPriorityBoost;
+  }
+  if (!adaptation?.enabled) {
+    sim.activeAdaptiveQuantum = null;
+    sim.lastAdaptiveQuantums = {
+      NORTH: null,
+      EAST: null,
+      SOUTH: null,
+      WEST: null,
+    };
+  }
   while (left > 1e-9 && !sim.finished) {
     const h = Math.min(H, left);
-    tick(sim, h, algo, quantum, aging);
+    tick(sim, h, algo, quantum, aging || (adaptation?.enabled ?? false), adaptation);
     logSignalChanges(sim, algo, quantum);
     left -= h;
   }
